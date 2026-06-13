@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: stl2ladder
+    runtime: static
+    # Vite build — drops in-browser Babel & the Tailwind CDN for a fast production load.
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
+    pullRequestPreviewsEnabled: false
+    headers:
+      # hashed asset bundles can be cached forever
+      - path: /assets/*
+        name: Cache-Control
+        value: "public, max-age=31536000, immutable"
+      # always revalidate the HTML entry
+      - path: /*
+        name: Cache-Control
+        value: "public, max-age=0, must-revalidate"
