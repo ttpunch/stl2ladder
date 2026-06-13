@@ -221,10 +221,24 @@ function parseNetwork(net) {
   const resetVKE = () => { frames = [{ or: [], cur: [] }]; opStack = []; lastLoad = null; };
   const contact = (kind, operand, comment) => ({ type: "CONTACT", kind, operand: operand || "??", negated: kind === "NC", comment: comment || null });
 
-  function pushRung(output, comment) {
-    if (comment && !output.comment) output.comment = comment;
-    rungs.push({ logic: currentLogic(), output, warnings: [] });
+  let pendingOutputs = [];
+  let emitted = false; // true after a write op; the next bit-logic instruction starts a new rung
+
+  function flushRung() {
+    if (pendingOutputs.length) {
+      rungs.push({ logic: currentLogic(), outputs: pendingOutputs, warnings: [] });
+    }
+    pendingOutputs = [];
     resetVKE();
+    emitted = false;
+  }
+  // a bit-logic instruction is starting; if outputs were already written, that begins a NEW rung
+  function beginLogic() { if (emitted) flushRung(); }
+  // S7 VKE persists across consecutive writes -> attach to the SAME rung's output list
+  function addOutput(output, comment) {
+    if (comment && !output.comment) output.comment = comment;
+    pendingOutputs.push(output);
+    emitted = true;
   }
 
   for (const instr of net.instrs) {
@@ -233,6 +247,10 @@ function parseNetwork(net) {
     if (!m) continue;
     const mUpper = m.toUpperCase();
     const operand = t[1];
+
+    // any bit-logic instruction (or a bare "(") begins a logic string; if outputs were
+    // just written, that starts a new rung (VKE persists only across writes, not logic).
+    if (["A","AN","O","ON","X","XN"].includes(mUpper) || m === "(") beginLogic();
 
     // bracket opens: A( O( AN( ON(
     if ((mUpper === "A" || mUpper === "AN" || mUpper === "O" || mUpper === "ON") && t[1] === "(") {
@@ -265,29 +283,31 @@ function parseNetwork(net) {
         if (!operand) { startOrTerm(); }
         else { startOrTerm(); top().cur.push(contact("NC", operand, cmt)); }
         break;
-      case "=":  pushRung({ kind: "COIL", operand }, cmt); break;
-      case "S":  pushRung({ kind: "SET", operand }, cmt); break;
-      case "R":  pushRung({ kind: "RESET", operand }, cmt); break;
-      case "FP": pushRung({ kind: "PEDGE", operand }, cmt); break;
-      case "FN": pushRung({ kind: "NEDGE", operand }, cmt); break;
+      case "=":  addOutput({ kind: "COIL", operand }, cmt); break;
+      case "S":  addOutput({ kind: "SET", operand }, cmt); break;
+      case "R":  addOutput({ kind: "RESET", operand }, cmt); break;
+      // FP/FN are inline edge detectors in the VKE chain (memory bit = operand),
+      // not output coils — render as ─┤P├─ / ─┤N├─ contacts in series.
+      case "FP": top().cur.push(contact("PEDGE", operand, cmt)); break;
+      case "FN": top().cur.push(contact("NEDGE", operand, cmt)); break;
       case "SD": case "SF": case "SS": case "SP": case "SE":
-        pushRung({ kind: "TIMER", timerType: mUpper, operand, preset: lastLoad }, cmt); break;
+        addOutput({ kind: "TIMER", timerType: mUpper, operand, preset: lastLoad }, cmt); break;
       case "CU": case "CD":
-        pushRung({ kind: "COUNTER", counterType: mUpper, operand, preset: lastLoad }, cmt); break;
+        addOutput({ kind: "COUNTER", counterType: mUpper, operand, preset: lastLoad }, cmt); break;
       case "L":  lastLoad = operand; break;
       case "T":
-        pushRung({ kind: "MOVE", src: lastLoad || "ACCU", dst: operand }, cmt); break;
+        addOutput({ kind: "MOVE", src: lastLoad || "ACCU", dst: operand }, cmt); break;
       case "CALL": {
         const parts = t.slice(1);
-        pushRung({ kind: "FBCALL", fb: parts[0] || "FB?", db: parts[1] || "" }, cmt);
+        addOutput({ kind: "FBCALL", fb: parts[0] || "FB?", db: parts[1] || "" }, cmt);
         break;
       }
       case "JC": case "JCN": case "JU": case "JZ": case "JN": case "JP": case "JM": case "LOOP":
         warnings.push(`Network ${net.number}: jump "${mUpper} ${operand||""}" is shown as annotation (not graphically resolvable).`);
-        pushRung({ kind: "JUMP", op: mUpper, label: operand }, cmt); break;
+        addOutput({ kind: "JUMP", op: mUpper, label: operand }, cmt); break;
       case "FR":
         warnings.push(`Network ${net.number}: "FR ${operand||""}" (free/enable) annotated.`);
-        pushRung({ kind: "BOX", title: "FR", operand }, cmt); break;
+        addOutput({ kind: "BOX", title: "FR", operand }, cmt); break;
       case "NOT":
         top().cur.push({ type: "CONTACT", kind: "NOT", operand: "NOT" }); break;
       case "SET": case "CLR": case "NOP":
@@ -304,14 +324,16 @@ function parseNetwork(net) {
     }
   }
 
-  // leftover logic with no terminator
-  if (top().or.length || top().cur.length) {
-    rungs.push({ logic: currentLogic(), output: null, warnings: ["No output assignment (incomplete rung)."] });
+  // flush the final rung, or emit leftover logic that never got an output
+  if (pendingOutputs.length) {
+    flushRung();
+  } else if (top().or.length || top().cur.length) {
+    rungs.push({ logic: currentLogic(), outputs: [], warnings: ["No output assignment (incomplete rung)."] });
   }
   if (bracketDepth !== 0) warnings.push(`Network ${net.number}: unbalanced brackets.`);
 
   if (rungs.length === 0) return null;
-  const hasUnsupported = warnings.length > 0 || rungs.some(r => r.output && (r.output.kind === "JUMP"));
+  const hasUnsupported = warnings.length > 0 || rungs.some(r => r.outputs.some(o => o.kind === "JUMP"));
   return { number: net.number, title: net.title, rungs, warnings, hasUnsupported };
 }
 
@@ -344,10 +366,10 @@ function Ladder({ networks, themeKey, zoom = 1, xlate }) {
     networks.forEach(net => {
       net.rungs.forEach((rung, ri) => {
         const m = measure(rung.logic);
-        const outBox = rung.output && ["TIMER","COUNTER","FBCALL","MOVE","JUMP","BOX"].includes(rung.output.kind);
-        const outW = outBox ? BOX_W : SYM;
+        const anyBox = (rung.outputs || []).some(o => ["TIMER","COUNTER","FBCALL","MOVE","JUMP","BOX"].includes(o.kind));
+        const outW = anyBox ? BOX_W : SYM;
         const need = RAIL_L + 12 + m.w + 50 + outW + 12 + RAIL_L;
-        rows.push({ net, rung, ri, mw: m.w, lanes: m.lanes, outBox, outW, need });
+        rows.push({ net, rung, ri, mw: m.w, lanes: m.lanes, outW, need });
       });
     });
     const width = Math.max(640, ...rows.map(r => r.need), 0);
@@ -389,6 +411,7 @@ function Ladder({ networks, themeKey, zoom = 1, xlate }) {
     els.push(<line key={k()} className="contact" x1={b2} y1={tp} x2={b2} y2={bt} />);
     if (n.kind === "NC") els.push(<line key={k()} className="contact" x1={b1-5} y1={bt} x2={b2+5} y2={tp} />);
     if (n.kind === "XOR") els.push(<text key={k()} className="symtext" x={(b1+b2)/2} y={cy+5} textAnchor="middle">{n.xn ? "X̄" : "X"}</text>);
+    if (n.kind === "PEDGE" || n.kind === "NEDGE") els.push(<text key={k()} className="symtext" x={(b1+b2)/2} y={cy+5} textAnchor="middle">{n.kind === "PEDGE" ? "P" : "N"}</text>);
     const nm = disp(n.operand);
     els.push(<text key={k()} className={isAddr(nm) ? addrClass(nm) : "operand"} x={(b1+b2)/2} y={tp-8} textAnchor="middle">{nm}</text>);
     drawIODetail(n.operand, tr(n.comment), (b1+b2)/2, cy+32);
@@ -470,12 +493,11 @@ function Ladder({ networks, themeKey, zoom = 1, xlate }) {
     };
     net.rungs.forEach(r => {
       collect(r.logic);
-      const o = r.output;
-      if (o) {
+      (r.outputs || []).forEach(o => {
         const tgt = o.operand || o.dst || o.fb;
         const r2 = splitComment(tgt, tr(o.comment)); const a = r2.addr || r2.name;
         if (a && !seenO.has(a)) { seenO.add(a); outs.push(a); }
-      }
+      });
     });
 
     // network header — colored per network (mirrors the editor gutter/header color)
@@ -491,9 +513,11 @@ function Ladder({ networks, themeKey, zoom = 1, xlate }) {
 
     net.rungs.forEach(rung => {
       const m = measure(rung.logic);
-      const outBox = rung.output && ["TIMER","COUNTER","FBCALL","MOVE","JUMP","BOX"].includes(rung.output.kind);
-      const outW = outBox ? BOX_W : SYM;
-      const laneCount = Math.max(m.lanes, outBox ? Math.ceil(BOX_H/LANE_H) : 1);
+      const outputs = rung.outputs || [];
+      const isBox = (o) => ["TIMER","COUNTER","FBCALL","MOVE","JUMP","BOX"].includes(o.kind);
+      const anyBox = outputs.some(isBox);
+      const outW = anyBox ? BOX_W : SYM;
+      const laneCount = Math.max(m.lanes, Math.max(1, outputs.length));
       const h = laneCount * LANE_H;
       const cy = y + h/2;
 
@@ -506,14 +530,23 @@ function Ladder({ networks, themeKey, zoom = 1, xlate }) {
       els.push(<line key={k()} className="wire" x1={RAIL_L} y1={cy} x2={xStart} y2={cy} />);
       const xEnd = renderNode(rung.logic, xStart, cy);
 
-      // output
+      // outputs — one or more coils/boxes that share this rung's VKE, stacked vertically
       const xOut = rightRailX - outW;
-      els.push(<line key={k()} className="wire" x1={xEnd} y1={cy} x2={xOut} y2={cy} />);
-      if (rung.output) {
-        if (outBox) drawBox(rung.output, xOut, cy);
-        else drawCoil(rung.output, xOut, cy);
-      } else {
+      if (outputs.length === 0) {
         els.push(<line key={k()} className="wire" x1={xEnd} y1={cy} x2={rightRailX} y2={cy} />);
+      } else {
+        const N = outputs.length;
+        const centers = outputs.map((_, i) => (cy - N * LANE_H / 2) + (i + 0.5) * LANE_H);
+        const branchX = xOut - 22;
+        els.push(<line key={k()} className="wire" x1={xEnd} y1={cy} x2={branchX} y2={cy} />);
+        if (N > 1) els.push(<line key={k()} className="wire" x1={branchX} y1={centers[0]} x2={branchX} y2={centers[N-1]} />);
+        outputs.forEach((o, i) => {
+          const ocy = N > 1 ? centers[i] : cy;
+          const ow = isBox(o) ? BOX_W : SYM;
+          els.push(<line key={k()} className="wire" x1={branchX} y1={ocy} x2={xOut} y2={ocy} />);
+          if (isBox(o)) drawBox(o, xOut, ocy); else drawCoil(o, xOut, ocy);
+          els.push(<line key={k()} className="wire" x1={xOut + ow} y1={ocy} x2={rightRailX} y2={ocy} />);
+        });
       }
       y += h;
     });
@@ -706,11 +739,11 @@ function buildCrossRef(networks) {
   };
   networks.forEach(net => net.rungs.forEach(r => {
     walk(r.logic, net.number);
-    const o = r.output;
-    if (!o) return;
-    if (["COIL","SET","RESET","PEDGE","NEDGE"].includes(o.kind)) add(o.operand, "w", net.number);
-    else if (o.kind === "TIMER" || o.kind === "COUNTER") add(o.operand, "w", net.number);
-    else if (o.kind === "MOVE") { add(o.src, "r", net.number); add(o.dst, "w", net.number); }
+    (r.outputs || []).forEach(o => {
+      if (["COIL","SET","RESET","PEDGE","NEDGE"].includes(o.kind)) add(o.operand, "w", net.number);
+      else if (o.kind === "TIMER" || o.kind === "COUNTER") add(o.operand, "w", net.number);
+      else if (o.kind === "MOVE") { add(o.src, "r", net.number); add(o.dst, "w", net.number); }
+    });
   }));
   return [...map.values()].sort((a,b) => a.type.localeCompare(b.type) || a.operand.localeCompare(b.operand));
 }
@@ -951,7 +984,7 @@ function App() {
   const allComments = useMemo(() => {
     const set = new Set();
     const walk = (n) => { if (!n) return; if (n.type === "CONTACT") { if (n.comment) set.add(n.comment.trim()); return; } (n.children || []).forEach(walk); };
-    networks.forEach(net => net.rungs.forEach(r => { walk(r.logic); if (r.output && r.output.comment) set.add(r.output.comment.trim()); }));
+    networks.forEach(net => net.rungs.forEach(r => { walk(r.logic); (r.outputs || []).forEach(o => { if (o.comment) set.add(o.comment.trim()); }); }));
     return [...set].filter(Boolean);
   }, [networks]);
 
