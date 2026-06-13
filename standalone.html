@@ -972,6 +972,56 @@ function ScanModal({ onClose, onInsert }) {
 }
 
 /* ============================================================= *
+ *  AUTH GATE  (client-side password — deterrent, not server auth)
+ *  Change the password locally with:  npm run set-password -- "yourPassword"
+ * ============================================================= */
+const PASSWORD_HASH = "e7c1a91471d9d97c4781a64e4c4cf4ee257019fa5a40f5bc1e4a71bc28ffb32f"; // default: stl2ladder
+async function sha256Hex(str) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+function AuthGate({ children }) {
+  const [authed, setAuthed] = useState(() => localStorage.getItem("stl_auth_ok") === PASSWORD_HASH);
+  const [pw, setPw] = useState("");
+  const [err, setErr] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const inputRef = useRef(null);
+
+  useEffect(() => { if (!authed && inputRef.current) inputRef.current.focus(); }, [authed]);
+
+  if (authed) return children;
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true); setErr(false);
+    const ok = (await sha256Hex(pw)) === PASSWORD_HASH;
+    setBusy(false);
+    if (ok) { localStorage.setItem("stl_auth_ok", PASSWORD_HASH); setAuthed(true); }
+    else { setErr(true); setPw(""); if (inputRef.current) inputRef.current.focus(); }
+  };
+
+  return (
+    <div className="dark" style={{ position: "fixed", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", background: "var(--bg)", padding: 16 }}>
+      <form onSubmit={submit} className="anim-in" style={{ width: "100%", maxWidth: 360, background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 18, padding: 28, textAlign: "center" }}>
+        <div style={{ width: 52, height: 52, margin: "0 auto 14px", borderRadius: 14, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 26, fontWeight: 700, background: "var(--accent)", color: "#04121a" }}>⎍</div>
+        <div style={{ fontWeight: 700, fontSize: 18, color: "var(--text)" }}>STL → Ladder Converter</div>
+        <div style={{ fontSize: 13, color: "var(--muted)", margin: "6px 0 20px" }}>This tool is private. Enter the password to continue.</div>
+        <input
+          ref={inputRef} type="password" value={pw} onChange={(e) => { setPw(e.target.value); setErr(false); }}
+          placeholder="Password" autoComplete="current-password" className="mono"
+          style={{ width: "100%", padding: "11px 14px", borderRadius: 10, border: `1px solid ${err ? "var(--coral)" : "var(--border)"}`, background: "var(--editorbg)", color: "var(--text)", fontSize: 14, outline: "none", boxSizing: "border-box" }}
+        />
+        {err && <div style={{ color: "var(--coral)", fontSize: 12, marginTop: 8 }}>Incorrect password. Try again.</div>}
+        <button type="submit" disabled={busy || !pw} className="btn btn-primary" style={{ width: "100%", marginTop: 16, justifyContent: "center", opacity: (busy || !pw) ? 0.6 : 1 }}>
+          {busy ? "Checking…" : "Unlock"}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+/* ============================================================= *
  *  MAIN APP
  * ============================================================= */
 function App() {
@@ -1324,6 +1374,8 @@ function inlineStyles(clone, cs) {
 function triggerDownload(url, name) {
   const a = document.createElement("a"); a.href = url; a.download = name; a.click();
 }
+
+createRoot(document.getElementById("root")).render(<AuthGate><App /></AuthGate>);
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 </script>
