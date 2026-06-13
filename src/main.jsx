@@ -315,8 +315,11 @@ function parseNetwork(net) {
       case "BLD": case "BE": case "BEU": case "BEC":
         break;
       default:
-        // comparators like >=I  ==I etc
-        if (/^[<>=!]=?[IDR]?$/.test(m) || /^(==|<>|>=|<=|>|<)[IDR]?$/.test(m)) {
+        // pointer / address-register ops — recognized, not graphically drawn (see Pointers help)
+        if (POINTER_OPS.has(mUpper)) {
+          break;
+        } else if (/^[<>=!]=?[IDR]?$/.test(m) || /^(==|<>|>=|<=|>|<)[IDR]?$/.test(m)) {
+          // comparators like >=I  ==I etc
           top().cur.push({ type: "CONTACT", kind: "COMPARE", operand: m });
         } else {
           warnings.push(`Network ${net.number}: unrecognized instruction "${m}".`);
@@ -682,6 +685,49 @@ function classify(tok) {
   return "";
 }
 
+/* ============================================================= *
+ *  STL POINTERS & INDIRECT ADDRESSING — help reference
+ * ============================================================= */
+const POINTER_REF = [
+  {
+    group: "Address registers",
+    items: [
+      { mn: "AR1", name: "Address Register 1", desc: "32-bit address register used for register-indirect addressing. Holds an area-internal or area-crossing pointer.", ex: "A   I[AR1,P#0.0]" },
+      { mn: "AR2", name: "Address Register 2", desc: "Second address register. The compiler uses AR2 to address multi-instance / FB instance-DB data.", ex: "L   DBW[AR2,P#4.0]" },
+    ],
+  },
+  {
+    group: "Load / transfer address registers",
+    items: [
+      { mn: "LAR1", name: "Load AR1", desc: "Load AR1 with a pointer — from ACCU 1 (no operand) or directly from a pointer / doubleword source.", ex: "LAR1  P#10.0     LAR1  MD20" },
+      { mn: "LAR2", name: "Load AR2", desc: "Load AR2 with a pointer (from ACCU 1 or a source).", ex: "LAR2  P#0.0" },
+      { mn: "TAR1", name: "Transfer AR1", desc: "Store AR1 to ACCU 1 (no operand) or to a doubleword destination.", ex: "TAR1  MD24" },
+      { mn: "TAR2", name: "Transfer AR2", desc: "Store AR2 to ACCU 1 or to a destination.", ex: "TAR2  MD28" },
+      { mn: "CAR", name: "Exchange AR1 ↔ AR2", desc: "Swap the contents of the two address registers.", ex: "CAR" },
+      { mn: "+AR1", name: "Add to AR1", desc: "Add ACCU 1 (or a P# offset) to AR1 — used to step a pointer through an array / field.", ex: "+AR1  P#2.0" },
+      { mn: "+AR2", name: "Add to AR2", desc: "Add ACCU 1 (or a P# offset) to AR2.", ex: "+AR2" },
+    ],
+  },
+  {
+    group: "Pointer literals (P#)",
+    items: [
+      { mn: "P#b.b", name: "Area-internal pointer", desc: "Pointer constant as byte.bit within the implied area. Loaded into an AR or a doubleword.", ex: "L   P#8.0" },
+      { mn: "P#area", name: "Area-crossing pointer", desc: "32-bit pointer that also carries the memory area (I/Q/M/…), so one pointer can reach several areas.", ex: "L   P#M10.0     L   P#I0.0" },
+      { mn: "P#DBx.DBX", name: "DB / ANY pointer", desc: "Full pointer for DB data, parameters and ANY types (passing arrays / structures to blocks).", ex: "L   P#DB10.DBX0.0" },
+    ],
+  },
+  {
+    group: "Indirect addressing",
+    items: [
+      { mn: "[MDx]", name: "Memory-indirect", desc: "Effective address taken from a doubleword that holds a P# pointer.", ex: "A   M[MD4]" },
+      { mn: "[AR1,P#]", name: "Register-indirect (area-internal)", desc: "Effective address = AR1 + the P# offset, within the operand's own area.", ex: "A   I[AR1,P#0.0]" },
+      { mn: "[AR1,P#] ×area", name: "Register-indirect (area-crossing)", desc: "AR1 carries the area too, so a single pointer can address I / Q / M / DB. Common for DB access.", ex: "L   DBW[AR1,P#2.0]" },
+    ],
+  },
+];
+// mnemonics treated as pointer / address-register ops (recognized, not graphically drawn)
+const POINTER_OPS = new Set(["AR1", "AR2", "LAR1", "LAR2", "TAR1", "TAR2", "LAR", "TAR", "CAR", "+AR1", "+AR2", "+AR", "TAW", "TAD"]);
+
 function HighlightedCode({ code, lineNet }) {
   const lines = code.split("\n");
   return lines.map((line, idx) => {
@@ -764,7 +810,8 @@ const I = {
   camera:"M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2zM12 17a4 4 0 100-8 4 4 0 000 8z",
   globe:"M12 2a10 10 0 100 20 10 10 0 000-20M2 12h20M12 2a15 15 0 010 20M12 2a15 15 0 000 20",
   x:"M18 6L6 18M6 6l12 12", check:"M20 6L9 17l-5-5", upload:"M12 3v12M8 7l4-4 4 4M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2",
-  shutter:"M12 2a10 10 0 100 20 10 10 0 000-20zM12 7a5 5 0 100 10 5 5 0 000-10z"
+  shutter:"M12 2a10 10 0 100 20 10 10 0 000-20zM12 7a5 5 0 100 10 5 5 0 000-10z",
+  help:"M12 2a10 10 0 100 20 10 10 0 000-20M9.1 9a3 3 0 015.8 1c0 2-3 3-3 3M12 17h.01"
 };
 
 /* ============================================================= *
@@ -903,6 +950,65 @@ function ScanModal({ onClose, onInsert }) {
 }
 
 /* ============================================================= *
+ *  POINTERS HELP MODAL  (STL pointers & indirect addressing)
+ * ============================================================= */
+function HelpModal({ onClose }) {
+  const [q, setQ] = useState("");
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const ql = q.trim().toLowerCase();
+  const match = (it) => !ql || it.mn.toLowerCase().includes(ql) || it.name.toLowerCase().includes(ql) || it.desc.toLowerCase().includes(ql);
+
+  return (
+    <div className="fixed inset-0 z-[80] flex items-center justify-center p-4" style={{ background: "rgba(0,0,0,.62)", backdropFilter: "blur(2px)" }} onClick={onClose}>
+      <div className="w-full max-w-2xl rounded-2xl overflow-hidden flex flex-col anim-in" style={{ background: "var(--panel)", border: "1px solid var(--border)", maxHeight: "92vh" }} onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-5 py-3" style={{ borderBottom: "1px solid var(--border)" }}>
+          <div className="flex items-center gap-2 font-bold"><span style={{ color: "var(--accent)" }}><Ico d={I.help} /></span>STL Pointers &amp; Indirect Addressing</div>
+          <button className="btn !px-2 !py-1" onClick={onClose}><Ico d={I.x} /></button>
+        </div>
+        <div className="px-5 pt-3">
+          <p className="text-xs mb-3" style={{ color: "var(--muted)" }}>
+            Pointers let STL address operands indirectly — computed at runtime via the address registers <span className="mono t-bool">AR1 / AR2</span> and
+            <span className="mono"> P#</span> pointer constants. These manipulate registers/addresses, not the rung logic, so the converter recognizes them but doesn't draw a ladder symbol.
+          </p>
+          <input value={q} onChange={e => setQ(e.target.value)} placeholder="Search pointers…" className="mono w-full"
+            style={{ padding: "9px 12px", borderRadius: 9, border: "1px solid var(--border)", background: "var(--editorbg)", color: "var(--text)", fontSize: 13, outline: "none", boxSizing: "border-box" }} />
+        </div>
+        <div className="px-5 py-3 overflow-auto">
+          {POINTER_REF.map(grp => {
+            const items = grp.items.filter(match);
+            if (!items.length) return null;
+            return (
+              <div key={grp.group} className="mb-3">
+                <div className="text-xs font-bold uppercase tracking-wider mb-1" style={{ color: "var(--accent)" }}>{grp.group}</div>
+                {items.map(it => (
+                  <div key={it.mn} className="flex items-start gap-3 py-2" style={{ borderBottom: "1px solid var(--border)" }}>
+                    <span className="mono t-bool" style={{ fontWeight: 700, minWidth: 92, fontSize: 13.5 }}>{it.mn}</span>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontWeight: 600, fontSize: 13 }}>{it.name}</div>
+                      <div style={{ fontSize: 12.5, color: "var(--muted)" }}>{it.desc}</div>
+                    </div>
+                    {it.ex && <span className="mono" style={{ fontSize: 11, color: "var(--operand)", whiteSpace: "nowrap", paddingTop: 2 }}>{it.ex}</span>}
+                  </div>
+                ))}
+              </div>
+            );
+          })}
+          <p className="text-xs mt-1" style={{ color: "var(--muted)" }}>
+            Pointer format: a 32-bit pointer is <span className="mono">2#0000 aaa0 0000 0000 0000 0bbb bbbb bxxx</span> — area <span className="mono">aaa</span>, byte address <span className="mono">b…</span>, bit number <span className="mono">xxx</span>.
+            Writing <span className="mono">P#10.0</span> means byte 10, bit 0.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================= *
  *  AUTH GATE  (client-side password — deterrent, not server auth)
  *  Change the password locally with:  npm run set-password -- "yourPassword"
  * ============================================================= */
@@ -966,6 +1072,7 @@ function App() {
   const [translations, setTranslations] = useState(() => { try { return JSON.parse(localStorage.getItem("stl_xlate") || "{}"); } catch (e) { return {}; } });
   const [trStatus, setTrStatus] = useState("");
   const [scanOpen, setScanOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
   const taRef = useRef(null), hlRef = useRef(null), gutterRef = useRef(null), scrollRef = useRef(null);
   const svgWrapRef = useRef(null);
 
@@ -1102,6 +1209,7 @@ function App() {
         </div>
         <button className="btn btn-primary" onClick={() => setDebounced(code)}><Ico d={I.play}/>Convert</button>
         <button className="btn" onClick={() => setScanOpen(true)}><Ico d={I.camera}/>Scan</button>
+        <button className="btn" title="STL pointers & indirect addressing help" onClick={() => setHelpOpen(true)}><Ico d={I.help}/>Pointers</button>
         <button className="btn" onClick={() => setCode("")}><Ico d={I.trash}/>Clear</button>
         <select value="" onChange={(e) => { if (e.target.value) setCode(EXAMPLES[e.target.value].code); }}>
           <option value="">📂 Load Example…</option>
@@ -1200,6 +1308,7 @@ function App() {
       </footer>
 
       {scanOpen && <ScanModal onClose={() => setScanOpen(false)} onInsert={(txt) => { setCode(txt); setDebounced(txt); setScanOpen(false); setTab("ladder"); }} />}
+      {helpOpen && <HelpModal onClose={() => setHelpOpen(false)} />}
     </div>
   );
 }
