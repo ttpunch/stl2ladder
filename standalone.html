@@ -1501,13 +1501,13 @@ const POINTER_LESSONS = [
   },
   {
     title: "6 · Stepping through data (+AR1)",
-    body: "+AR1 adds an offset to AR1 — this is how you walk an array. Add P#1.0 to advance one byte, P#2.0 for a word, P#4.0 for a doubleword. Combine with LOOP to process a whole block.",
-    code: "      LAR1  P#DBX0.0\n      L     10\n      T     MW100\nNEXT: L     DBB[AR1,P#0.0]\n      T     MB[AR1,P#0.0]\n      +AR1  P#1.0          // next byte\n      L     MW100\n      LOOP  NEXT",
+    body: "+AR1 adds an offset to AR1 — this is how you walk an array. Add P#1.0 to advance one byte, P#2.0 for a word, P#4.0 for a doubleword. LOOP decrements ACCU1 and jumps while it is non-zero — note the counter is stored back (T MW100) at the label, otherwise the loop never ends. Watch this exact pattern run in the ▶ Pointer Simulator.",
+    code: "      LAR1  P#M10.0        // AR1 → flag byte 10\n      L     5              // process 5 bytes\nNEXT: T     MW100          // store loop counter!\n      L     99\n      T     B[AR1,P#0.0]   // write via AR1\n      +AR1  P#1.0          // next byte\n      L     MW100          // reload counter\n      LOOP  NEXT           // ACCU1−1, jump while ≠ 0",
   },
   {
     title: "7 · Copy loop: DB10 → DB20",
-    body: "The classic block-copy: open the source and destination DBs, point AR1 and AR2 into each, then loop — read via AR1, write via AR2, advance both. This is exactly the routine you'd write to move a recipe or a data record.",
-    code: "      OPN   DB10\n      LAR1  P#DBX0.0\n      OPN   DB20\n      LAR2  P#DBX0.0\n      L     10\n      T     MW100\nLOOP1: L     B[AR1,P#0.0]\n       T     B[AR2,P#0.0]\n       +AR1  P#1.0\n       +AR2  P#1.0\n       L     MW100\n       LOOP  LOOP1",
+    body: "The classic block-copy — but note the trap: a DBX pointer always reads the CURRENTLY open DB, so two OPN DBs would clobber each other. The correct S7 pattern opens the destination as an instance DB (OPN DI) and points AR2 with P#DIX. Run this step by step in the ▶ Pointer Simulator to watch the bytes move.",
+    code: "      OPN   DB10           // DB register = source\n      OPN   DI20           // DI register = destination\n      LAR1  P#DBX0.0       // AR1 → DB10 byte 0\n      LAR2  P#DIX0.0       // AR2 → DB20 byte 0\n      L     5              // 5 bytes\nNEXT: T     MW100          // store loop counter\n      L     B[AR1,P#0.0]   // read source via AR1\n      T     B[AR2,P#0.0]   // write destination via AR2\n      +AR1  P#1.0\n      +AR2  P#1.0\n      L     MW100\n      LOOP  NEXT",
   },
   {
     title: "8 · Memory-indirect",
@@ -1554,11 +1554,380 @@ function PointerCalc() {
   );
 }
 
+/* ============================================================= *
+ *  POINTER SIMULATOR — step-through interpreter that makes
+ *  indirect addressing visible: registers + memory grids + log.
+ * ============================================================= */
+function fmtP(v) {
+  v = v >>> 0;
+  const names = { 0x81: "I", 0x82: "Q", 0x83: "M", 0x84: "DBX", 0x85: "DIX", 0x86: "L" };
+  const nm = names[(v >>> 24) & 0xff] || "";
+  return `P#${nm}${(v >>> 3) & 0xffff}.${v & 7}`;
+}
+// "B[AR1,P#0.0]" / "M[AR1,P#0.0]" / "[AR2,P#1.0]" -> parts
+function parseArInd(tok) {
+  const m = String(tok || "").toUpperCase().match(/^([A-Z]*)\[(AR1|AR2)(?:,P#(\d+)\.([0-7]))?\]$/);
+  if (!m) return null;
+  return { prefix: m[1] || "", reg: m[2] === "AR1" ? "ar1" : "ar2", offB: +(m[3] || 0), offX: +(m[4] || 0) };
+}
+// "M[MD40]" -> memory-indirect via pointer stored in MD
+function parseMemInd(tok) {
+  const m = String(tok || "").toUpperCase().match(/^([A-Z]*)\[MD(\d+)\]$/);
+  if (!m) return null;
+  return { prefix: m[1] || "", md: +m[2] };
+}
+function ptrBytes(st, key) {
+  if (key === "M") return st.M;
+  if (key === "I") return st.I;
+  if (key === "Q") return st.Q;
+  if (key === "DB") { if (!st.dbs[st.db]) st.dbs[st.db] = new Array(32).fill(0); return st.dbs[st.db]; }
+  if (key === "DI") { if (!st.dbs[st.di]) st.dbs[st.di] = new Array(32).fill(0); return st.dbs[st.di]; }
+  return st.M;
+}
+// resolve a pointer value (+offset) to a concrete address
+function ptrResolve(st, ptrVal, prefix, offB, offX) {
+  const bits = ((ptrVal & 0x7ffff) + ((offB || 0) << 3) + (offX || 0));
+  const byte = (bits >> 3) & 0xffff, bit = bits & 7;
+  const areaB = (ptrVal >>> 24) & 0xff;
+  const p = (prefix || "").toUpperCase();
+  let key;
+  if (areaB === 0x81) key = "I"; else if (areaB === 0x82) key = "Q"; else if (areaB === 0x83) key = "M";
+  else if (areaB === 0x85) key = "DI";
+  else if (areaB === 0x84) key = "DB";
+  else if (p.startsWith("M")) key = "M"; else if (p.startsWith("I")) key = "I"; else if (p.startsWith("Q")) key = "Q";
+  else if (p.startsWith("DI")) key = "DI"; else key = "DB";
+  const areaName = key === "DB" ? "DB" + st.db : key === "DI" ? "DB" + st.di : key;
+  const prettyByte = key === "M" ? "MB" + byte : key === "I" ? "IB" + byte : key === "Q" ? "QB" + byte : areaName + ".DBB" + byte;
+  const prettyBit = key === "M" || key === "I" || key === "Q" ? key + byte + "." + bit : areaName + ".DBX" + byte + "." + bit;
+  return { key, areaName, byte, bit, prettyByte, prettyBit };
+}
+function ptrSimInit(demo) {
+  const st = {
+    pc: 0, steps: 0, done: false, rlo: false, rloFresh: true,
+    accu1: 0, accu2: 0, ar1: 0, ar2: 0, ar1Set: false, ar2Set: false, db: 0, di: 0,
+    M: new Array(128).fill(0), I: new Array(16).fill(0), Q: new Array(16).fill(0), dbs: {},
+    lines: [], labels: {}, log: [], lastW: null,
+  };
+  demo.code.split("\n").forEach(ln => {
+    const { tokens } = tokenizeLine(ln);
+    const tk = tokens.filter(x => x !== ",");
+    if (!tk.length) return;
+    let t = tk;
+    if (/^[A-Za-z_]\w*:$/.test(t[0])) { st.labels[t[0].slice(0, -1).toUpperCase()] = st.lines.length; t = t.slice(1); }
+    if (t.length) st.lines.push({ mn: t[0].toUpperCase(), args: t.slice(1), src: ln.replace(/\s+$/, "") });
+  });
+  if (demo.init) demo.init(st);
+  return st;
+}
+function ptrSimStep(st) {
+  if (st.done || st.pc >= st.lines.length) { st.done = true; return "✓ Program complete."; }
+  if (++st.steps > 400) { st.done = true; return "Stopped: step limit reached."; }
+  const { mn, args } = st.lines[st.pc];
+  const a0 = args[0] || "";
+  let desc = mn + " " + args.join(" ");
+  let jumped = false;
+  const num = (s) => {
+    s = String(s || "").toUpperCase();
+    const p = parsePointerLiteral(s);
+    if (p) return pointer32Bits(p).val;
+    if (/^(DW#16#|W#16#|B#16#|16#)/.test(s)) return parseInt(s.replace(/^.*16#/, ""), 16) >>> 0;
+    return parseInt(s, 10) || 0;
+  };
+  const getPtrOf = (tok) => { // pointer value + label for AR- or MD-indirect operands
+    const ai = parseArInd(tok);
+    if (ai) return { val: st[ai.reg] >>> 0, prefix: ai.prefix, offB: ai.offB, offX: ai.offX, via: ai.reg.toUpperCase() + " (" + fmtP(st[ai.reg]) + ")" };
+    const mi = parseMemInd(tok);
+    if (mi) {
+      const v = ((st.M[mi.md] << 24) | (st.M[mi.md + 1] << 16) | (st.M[mi.md + 2] << 8) | st.M[mi.md + 3]) >>> 0;
+      return { val: v, prefix: mi.prefix, offB: 0, offX: 0, via: "MD" + mi.md + " (" + fmtP(v) + ")" };
+    }
+    return null;
+  };
+  const bitWrite = (kind) => {
+    const ind = getPtrOf(a0);
+    let r = null, pretty = "";
+    if (ind) { r = ptrResolve(st, ind.val, ind.prefix, ind.offB, ind.offX); pretty = r.prettyBit + " (via " + ind.via + ")"; }
+    else {
+      const dm = a0.toUpperCase().match(/^([IQM])(\d+)\.([0-7])$/);
+      if (dm) { r = { key: dm[1], areaName: dm[1], byte: +dm[2], bit: +dm[3], prettyBit: a0.toUpperCase() }; pretty = r.prettyBit; }
+    }
+    if (!r) return mn + " " + a0 + " — operand not supported here.";
+    const arr = ptrBytes(st, r.key);
+    const val = kind === "=" ? st.rlo : kind === "S" ? (st.rlo ? true : ((arr[r.byte] >> r.bit) & 1) === 1) : (st.rlo ? false : ((arr[r.byte] >> r.bit) & 1) === 1);
+    arr[r.byte] = val ? (arr[r.byte] | (1 << r.bit)) : (arr[r.byte] & ~(1 << r.bit));
+    st.lastW = { areaName: r.areaName, byte: r.byte };
+    st.rloFresh = true;
+    return (kind === "=" ? "Write RLO(" + (st.rlo ? 1 : 0) + ") to " : kind === "S" ? "Set " : "Reset ") + pretty;
+  };
+  const bitRead = (neg) => {
+    const ind = getPtrOf(a0);
+    let r = null, pretty = "";
+    if (ind) { r = ptrResolve(st, ind.val, ind.prefix, ind.offB, ind.offX); pretty = r.prettyBit + " (via " + ind.via + ")"; }
+    else {
+      const dm = a0.toUpperCase().match(/^([IQM])(\d+)\.([0-7])$/);
+      if (dm) { r = { key: dm[1], byte: +dm[2], bit: +dm[3], prettyBit: a0.toUpperCase() }; pretty = r.prettyBit; }
+    }
+    if (!r) return mn + " " + a0 + " — operand not supported here.";
+    let v = ((ptrBytes(st, r.key)[r.byte] >> r.bit) & 1) === 1;
+    if (neg) v = !v;
+    st.rlo = st.rloFresh ? v : (st.rlo && v);
+    st.rloFresh = false;
+    return mn + " " + a0 + " → " + pretty + " = " + (v ? 1 : 0) + "  ⇒ RLO = " + (st.rlo ? 1 : 0);
+  };
+  switch (mn) {
+    case "OPN": {
+      const s = a0.toUpperCase().replace(/\s/g, "");
+      const mdi = s.match(/^DI(\d+)$/), mdb = s.match(/^DB(\d+)$/);
+      if (mdi) { st.di = +mdi[1]; ptrBytes(st, "DI"); desc = "Open instance-DB register: DI := DB" + st.di + " (DIX pointers now hit DB" + st.di + ")"; }
+      else if (mdb) { st.db = +mdb[1]; ptrBytes(st, "DB"); desc = "Open DB register: DB := DB" + st.db + " (DBX pointers now hit DB" + st.db + ")"; }
+      break;
+    }
+    case "LAR1": case "LAR2": {
+      const r = mn === "LAR1" ? "ar1" : "ar2";
+      st[r] = a0 ? num(a0) : st.accu1 >>> 0;
+      st[r + "Set"] = true;
+      const res = ptrResolve(st, st[r], "", 0, 0);
+      desc = r.toUpperCase() + " := " + fmtP(st[r]) + (a0 ? "" : " (from ACCU1)") + " — now points at " + res.areaName + " byte " + res.byte;
+      break;
+    }
+    case "TAR1": case "TAR2": {
+      const r = mn === "TAR1" ? "ar1" : "ar2";
+      const md = a0.toUpperCase().match(/^MD(\d+)$/);
+      if (md) {
+        const n = +md[1], v = st[r] >>> 0;
+        st.M[n] = (v >>> 24) & 255; st.M[n + 1] = (v >>> 16) & 255; st.M[n + 2] = (v >>> 8) & 255; st.M[n + 3] = v & 255;
+        st.lastW = { areaName: "M", byte: n };
+        desc = "MD" + n + " := " + r.toUpperCase() + " (" + fmtP(v) + ")";
+      } else { st.accu2 = st.accu1; st.accu1 = st[r] >>> 0; desc = "ACCU1 := " + r.toUpperCase() + " (" + fmtP(st.accu1) + ")"; }
+      break;
+    }
+    case "CAR": { const t = st.ar1; st.ar1 = st.ar2; st.ar2 = t; const t2 = st.ar1Set; st.ar1Set = st.ar2Set; st.ar2Set = t2; desc = "Swap AR1 ⇄ AR2 — AR1 = " + fmtP(st.ar1) + ", AR2 = " + fmtP(st.ar2); break; }
+    case "+AR1": case "+AR2": {
+      const r = mn === "+AR1" ? "ar1" : "ar2";
+      const add = a0 ? (num(a0) & 0x7ffff) : (st.accu1 & 0xffff);
+      st[r] = (((st[r] & 0xff000000) >>> 0) | (((st[r] & 0x7ffff) + add) & 0x7ffff)) >>> 0;
+      const res = ptrResolve(st, st[r], "", 0, 0);
+      desc = r.toUpperCase() + " advanced by " + (a0 || "ACCU1") + " → " + fmtP(st[r]) + " (" + res.areaName + " byte " + res.byte + ")";
+      break;
+    }
+    case "L": {
+      st.accu2 = st.accu1;
+      const ind = getPtrOf(a0);
+      const mw = a0.toUpperCase().match(/^MW(\d+)$/), mb = a0.toUpperCase().match(/^MB(\d+)$/), dbb = a0.toUpperCase().match(/^DBB(\d+)$/);
+      if (ind) {
+        const r = ptrResolve(st, ind.val, ind.prefix, ind.offB, ind.offX);
+        st.accu1 = ptrBytes(st, r.key)[r.byte] || 0;
+        desc = "Resolve " + a0 + " via " + ind.via + " → " + r.prettyByte + " — read " + st.accu1 + " into ACCU1";
+      }
+      else if (mw) { const n = +mw[1]; st.accu1 = ((st.M[n] << 8) | st.M[n + 1]) & 0xffff; desc = "ACCU1 := MW" + n + " = " + st.accu1; }
+      else if (mb) { st.accu1 = st.M[+mb[1]] || 0; desc = "ACCU1 := MB" + mb[1] + " = " + st.accu1; }
+      else if (dbb) { st.accu1 = ptrBytes(st, "DB")[+dbb[1]] || 0; desc = "ACCU1 := DB" + st.db + ".DBB" + dbb[1] + " = " + st.accu1; }
+      else {
+        st.accu1 = num(a0) >>> 0;
+        desc = /^P#/i.test(a0) ? "ACCU1 := " + a0.toUpperCase() + " = DW#16#" + st.accu1.toString(16).toUpperCase().padStart(8, "0") + " (a pointer is just a number)" : "ACCU1 := " + st.accu1;
+      }
+      break;
+    }
+    case "T": {
+      const ind = getPtrOf(a0);
+      const mw = a0.toUpperCase().match(/^MW(\d+)$/), mb = a0.toUpperCase().match(/^MB(\d+)$/), md = a0.toUpperCase().match(/^MD(\d+)$/), dbb = a0.toUpperCase().match(/^DBB(\d+)$/);
+      if (ind) {
+        const r = ptrResolve(st, ind.val, ind.prefix, ind.offB, ind.offX);
+        ptrBytes(st, r.key)[r.byte] = st.accu1 & 255;
+        st.lastW = { areaName: r.areaName, byte: r.byte };
+        desc = "Resolve " + a0 + " via " + ind.via + " → " + r.prettyByte + " — write " + (st.accu1 & 255);
+      }
+      else if (mw) { const n = +mw[1]; st.M[n] = (st.accu1 >> 8) & 255; st.M[n + 1] = st.accu1 & 255; st.lastW = { areaName: "M", byte: n }; desc = "MW" + n + " := " + (st.accu1 & 0xffff); }
+      else if (md) { const n = +md[1], v = st.accu1 >>> 0; st.M[n] = (v >>> 24) & 255; st.M[n + 1] = (v >>> 16) & 255; st.M[n + 2] = (v >>> 8) & 255; st.M[n + 3] = v & 255; st.lastW = { areaName: "M", byte: n }; desc = "MD" + n + " := DW#16#" + v.toString(16).toUpperCase().padStart(8, "0") + " (pointer parked in memory)"; }
+      else if (mb) { st.M[+mb[1]] = st.accu1 & 255; st.lastW = { areaName: "M", byte: +mb[1] }; desc = "MB" + mb[1] + " := " + (st.accu1 & 255); }
+      else if (dbb) { ptrBytes(st, "DB")[+dbb[1]] = st.accu1 & 255; st.lastW = { areaName: "DB" + st.db, byte: +dbb[1] }; desc = "DB" + st.db + ".DBB" + dbb[1] + " := " + (st.accu1 & 255); }
+      break;
+    }
+    case "LOOP": {
+      st.accu1 = (st.accu1 - 1) & 0xffff;
+      const tgt = st.labels[a0.toUpperCase()];
+      if (st.accu1 !== 0 && tgt != null) { st.pc = tgt; jumped = true; desc = "LOOP: ACCU1 − 1 = " + st.accu1 + " ≠ 0 → jump back to " + a0.toUpperCase(); }
+      else desc = "LOOP: ACCU1 − 1 = 0 → loop finished, fall through";
+      break;
+    }
+    case "JU": { const tgt = st.labels[a0.toUpperCase()]; if (tgt != null) { st.pc = tgt; jumped = true; desc = "Jump to " + a0.toUpperCase(); } break; }
+    case "SET": st.rlo = true; st.rloFresh = false; desc = "RLO := 1"; break;
+    case "CLR": st.rlo = false; st.rloFresh = false; desc = "RLO := 0"; break;
+    case "A": desc = bitRead(false); break;
+    case "AN": desc = bitRead(true); break;
+    case "=": desc = bitWrite("="); break;
+    case "S": desc = bitWrite("S"); break;
+    case "R": desc = bitWrite("R"); break;
+    case "NOP": case "BLD": break;
+    default: desc = mn + " — not simulated here (skipped)."; break;
+  }
+  if (!jumped) st.pc++;
+  if (st.pc >= st.lines.length) st.done = true;
+  st.log.push(desc);
+  if (st.log.length > 8) st.log.shift();
+  return desc;
+}
+
+const PTRSIM_DEMOS = [
+  {
+    name: "Copy 5 bytes: DB10 → DB20",
+    intro: "The classic block copy, written the CORRECT S7 way: source DB in the DB register (DBX + AR1), destination in the instance-DB register (OPN DI / DIX + AR2) so the two OPNs don't clobber each other. Watch AR1/AR2 walk the grids and the bytes appear in DB20.",
+    grids: [{ label: "DB10 (source)", area: "DB10", from: 0, count: 8 }, { label: "DB20 (destination)", area: "DB20", from: 0, count: 8 }],
+    init: (st) => { st.dbs[10] = new Array(32).fill(0); [11, 22, 33, 44, 55].forEach((v, i) => st.dbs[10][i] = v); st.dbs[20] = new Array(32).fill(0); },
+    code: "      OPN   DB10           // DB register = source\n      OPN   DI20           // DI register = destination\n      LAR1  P#DBX0.0       // AR1 → DB10 byte 0\n      LAR2  P#DIX0.0       // AR2 → DB20 byte 0\n      L     5              // 5 bytes to copy\nNEXT: T     MW100          // store loop counter\n      L     B[AR1,P#0.0]   // read source byte via AR1\n      T     B[AR2,P#0.0]   // write destination via AR2\n      +AR1  P#1.0          // advance source pointer\n      +AR2  P#1.0          // advance destination pointer\n      L     MW100          // reload counter\n      LOOP  NEXT           // ACCU1−1, jump while ≠ 0",
+  },
+  {
+    name: "Write a bit through AR1",
+    intro: "Build a pointer to flag M2.4, load it into AR1, then write the bit *through the register* — the instruction never names M2.4, yet that exact bit changes. Then read it back directly to prove it.",
+    grids: [{ label: "M flags (bytes 0–7)", area: "M", from: 0, count: 8 }, { label: "Q outputs", area: "Q", from: 0, count: 4 }],
+    code: "      L     P#M2.4         // pointer to flag M2.4\n      LAR1                 // AR1 := ACCU1\n      SET                  // RLO := 1\n      =     M[AR1,P#0.0]   // write M2.4 — via AR1!\n      A     M2.4           // read it back directly\n      =     Q0.0           // lamp on",
+  },
+  {
+    name: "Fill an array with +AR1",
+    intro: "Point AR1 at M byte 10 (area-crossing), then loop: write 99, step AR1 one byte with +AR1, repeat. This is the pattern behind every 'process N items' routine.",
+    grids: [{ label: "M bytes 8–17", area: "M", from: 8, count: 10 }],
+    code: "      LAR1  P#M10.0        // AR1 → flag byte 10\n      L     5              // fill 5 bytes\nNEXT: T     MW100          // store loop counter\n      L     99             // the fill value\n      T     B[AR1,P#0.0]   // write via AR1\n      +AR1  P#1.0          // next byte\n      L     MW100\n      LOOP  NEXT",
+  },
+  {
+    name: "Memory-indirect: M[MD40]",
+    intro: "No address register at all: the pointer lives in doubleword MD40. Every access reads MD40 first, then goes where it points. Watch the pointer get parked into M bytes 40–43, then steer the bit write to M20.0.",
+    grids: [{ label: "M bytes 16–23 (target)", area: "M", from: 16, count: 8 }, { label: "MD40 = pointer (bytes 40–43)", area: "M", from: 40, count: 4 }],
+    code: "      L     P#20.0         // pointer: byte 20, bit 0\n      T     MD40           // park it in MD40\n      SET                  // RLO := 1\n      =     M[MD40]        // write M20.0 — via MD40!\n      A     M[MD40]        // read back through the pointer\n      =     Q0.1",
+  },
+];
+
+function PointerSim() {
+  const [demoIdx, setDemoIdx] = useState(0);
+  const stRef = useRef(ptrSimInit(PTRSIM_DEMOS[0]));
+  const [, setTick] = useState(0);
+  const [running, setRunning] = useState(false);
+  const demo = PTRSIM_DEMOS[demoIdx];
+  const st = stRef.current;
+
+  const reset = (idx = demoIdx) => { stRef.current = ptrSimInit(PTRSIM_DEMOS[idx]); setRunning(false); setTick(t => t + 1); };
+  const step = () => { ptrSimStep(stRef.current); setTick(t => t + 1); };
+  useEffect(() => {
+    if (!running) return;
+    const id = setInterval(() => {
+      ptrSimStep(stRef.current);
+      if (stRef.current.done) setRunning(false);
+      setTick(t => t + 1);
+    }, 550);
+    return () => clearInterval(id);
+  }, [running, demoIdx]);
+
+  // marker positions for AR1 / AR2 on the grids
+  const marker = (r, set) => set ? ptrResolve(st, st[r], "", 0, 0) : null;
+  const m1 = marker("ar1", st.ar1Set), m2 = marker("ar2", st.ar2Set);
+
+  const Reg = ({ name, value, hint }) => (
+    <div className="rounded-lg px-2.5 py-1.5" style={{ background: "var(--editorbg)", border: "1px solid var(--border)" }}>
+      <div className="text-[10px] uppercase tracking-wider" style={{ color: "var(--muted)" }}>{name}</div>
+      <div className="mono text-xs font-bold" style={{ color: "var(--accent)" }}>{value}</div>
+      {hint && <div className="text-[10px]" style={{ color: "var(--muted)" }}>{hint}</div>}
+    </div>
+  );
+
+  return (
+    <div className="anim-in">
+      <div className="flex items-center gap-2 mb-3 flex-wrap">
+        <select value={demoIdx} onChange={e => { setDemoIdx(+e.target.value); reset(+e.target.value); }}>
+          {PTRSIM_DEMOS.map((d, i) => <option key={i} value={i}>{d.name}</option>)}
+        </select>
+        <button className="btn btn-primary" disabled={st.done} onClick={step} style={st.done ? { opacity: .5 } : {}}>Step ▸</button>
+        <button className="btn" onClick={() => setRunning(r => !r)} disabled={st.done} style={st.done ? { opacity: .5 } : {}}>{running ? "Pause" : "Run ▸▸"}</button>
+        <button className="btn" onClick={() => reset()}><Ico d={I.reset} />Reset</button>
+      </div>
+      <p className="text-xs mb-3" style={{ color: "var(--muted)", lineHeight: 1.5 }}>{demo.intro}</p>
+
+      {/* registers */}
+      <div className="grid grid-cols-3 sm:grid-cols-6 gap-2 mb-3">
+        <Reg name="ACCU1" value={String(st.accu1 >>> 0 > 0xffff ? "16#" + (st.accu1 >>> 0).toString(16).toUpperCase() : st.accu1)} />
+        <Reg name="ACCU2" value={String(st.accu2 >>> 0 > 0xffff ? "16#" + (st.accu2 >>> 0).toString(16).toUpperCase() : st.accu2)} />
+        <Reg name="AR1" value={st.ar1Set ? fmtP(st.ar1) : "—"} hint={m1 ? "→ " + m1.areaName + " byte " + m1.byte : null} />
+        <Reg name="AR2" value={st.ar2Set ? fmtP(st.ar2) : "—"} hint={m2 ? "→ " + m2.areaName + " byte " + m2.byte : null} />
+        <Reg name="DB / DI" value={(st.db ? "DB" + st.db : "—") + " / " + (st.di ? "DB" + st.di : "—")} />
+        <Reg name="RLO" value={st.rlo ? "1" : "0"} />
+      </div>
+
+      {/* memory grids */}
+      <div className="flex gap-3 flex-wrap mb-3">
+        {demo.grids.map((g, gi) => {
+          const bytes = g.area === "M" ? st.M : g.area === "Q" ? st.Q : g.area === "I" ? st.I : (st.dbs[+g.area.slice(2)] || []);
+          return (
+            <div key={gi} className="rounded-xl p-2.5" style={{ background: "var(--panel2)", border: "1px solid var(--border)" }}>
+              <div className="text-[11px] font-bold mb-1.5" style={{ color: "var(--muted)" }}>{g.label}</div>
+              <div className="flex gap-1">
+                {Array.from({ length: g.count }, (_, j) => {
+                  const idx = g.from + j;
+                  const isAR1 = m1 && m1.areaName === g.area && m1.byte === idx;
+                  const isAR2 = m2 && m2.areaName === g.area && m2.byte === idx;
+                  const wrote = st.lastW && st.lastW.areaName === g.area && st.lastW.byte === idx;
+                  return (
+                    <div key={j} className="text-center">
+                      <div className="text-[9px] mono h-3.5" style={{ color: isAR1 ? "var(--amber)" : isAR2 ? "var(--accent)" : "transparent", fontWeight: 700 }}>
+                        {isAR1 && isAR2 ? "A1+2" : isAR1 ? "AR1▾" : isAR2 ? "AR2▾" : "·"}
+                      </div>
+                      <div className="mono flex items-center justify-center" style={{
+                        width: 34, height: 30, borderRadius: 6, fontSize: 12, fontWeight: 700,
+                        border: "2px solid " + (isAR1 ? "var(--amber)" : isAR2 ? "var(--accent)" : "var(--border)"),
+                        background: wrote ? "rgba(45,255,143,.18)" : "var(--editorbg)",
+                        color: wrote ? "#2dff8f" : (bytes[idx] ? "var(--text)" : "var(--muted)"),
+                      }}>{bytes[idx] || 0}</div>
+                      <div className="text-[9px] mono" style={{ color: "var(--muted)" }}>{idx}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="flex gap-3 flex-wrap">
+        {/* code listing with program counter */}
+        <pre className="mono flex-1" style={{ minWidth: 300, background: "var(--editorbg)", border: "1px solid var(--border)", borderRadius: 10, padding: "10px 0", fontSize: 12, lineHeight: "19px", overflow: "auto", whiteSpace: "pre", margin: 0 }}>
+          {demo.code.split("\n").map((ln, i2) => {
+            // map source line to instruction index (labels stripped in engine)
+            const active = !st.done && st.lines[st.pc] && ln.replace(/\s+$/, "") === st.lines[st.pc].src;
+            return <div key={i2} style={{ padding: "0 12px", background: active ? "rgba(0,212,255,.14)" : "transparent", borderLeft: active ? "3px solid var(--accent)" : "3px solid transparent" }}>{ln || " "}</div>;
+          })}
+        </pre>
+        {/* explanation log */}
+        <div className="flex-1 rounded-xl p-3" style={{ minWidth: 280, background: "var(--panel2)", border: "1px solid var(--border)" }}>
+          <div className="text-[11px] font-bold uppercase tracking-wider mb-1.5" style={{ color: "var(--accent)" }}>What just happened</div>
+          {st.log.length === 0 && <div className="text-xs" style={{ color: "var(--muted)" }}>Press <b>Step</b> to execute one instruction at a time — each step is explained here, and you'll see AR1/AR2 markers move over the memory bytes above.</div>}
+          {st.log.map((l, i2) => (
+            <div key={i2} className="text-xs py-1" style={{ color: i2 === st.log.length - 1 ? "var(--text)" : "var(--muted)", fontWeight: i2 === st.log.length - 1 ? 600 : 400, borderBottom: "1px solid var(--border)" }}>{l}</div>
+          ))}
+          {st.done && <div className="text-xs pt-1.5 font-bold" style={{ color: "#2dff8f" }}>✓ Done — press Reset to run it again.</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function PointerSchool({ onLoad }) {
+  const [mode, setMode] = useState("lessons");
   const [i, setI] = useState(0);
   const L = POINTER_LESSONS[i];
+  if (mode === "sim") {
+    return (
+      <div className="p-4 anim-in" style={{ maxWidth: 860 }}>
+        <div className="flex items-center gap-2 mb-3">
+          <button className="btn" onClick={() => setMode("lessons")}>📖 Lessons</button>
+          <button className="btn !border-[var(--accent)] !text-[var(--accent)]">▶ Pointer Simulator</button>
+        </div>
+        <PointerSim />
+      </div>
+    );
+  }
   return (
     <div className="p-4 anim-in" style={{ maxWidth: 720 }}>
+      <div className="flex items-center gap-2 mb-3">
+        <button className="btn !border-[var(--accent)] !text-[var(--accent)]">📖 Lessons</button>
+        <button className="btn" onClick={() => setMode("sim")}>▶ Pointer Simulator</button>
+      </div>
       <div className="flex items-center gap-2 mb-3 flex-wrap">
         {POINTER_LESSONS.map((_, n) => (
           <button key={n} onClick={() => setI(n)} className="mono"
