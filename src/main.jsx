@@ -122,9 +122,23 @@ function tokenizeLine(raw) {
       while (j < line.length && line[j] !== '"') j++;
       tokens.push(line.slice(i, j + 1)); i = j + 1; continue;
     }
-    let j = i;
-    while (j < line.length && !" \t(),".includes(line[j])) j++;
+    // read a token; keep [...] indirect-address content (and quotes) intact
+    let j = i, depth = 0, q = false;
+    while (j < line.length) {
+      const ch = line[j];
+      if (ch === '"') q = !q;
+      else if (!q && ch === "[") depth++;
+      else if (!q && ch === "]") depth = Math.max(0, depth - 1);
+      else if (!q && depth === 0 && " \t(),".includes(ch)) break;
+      j++;
+    }
     tokens.push(line.slice(i, j)); i = j;
+  }
+  // merge "B [AR1,P#0.0]" style: a bracketed token attaches to the preceding operand
+  for (let x = tokens.length - 1; x > 0; x--) {
+    if (tokens[x].startsWith("[") && !"(),".includes(tokens[x - 1])) {
+      tokens[x - 1] += tokens[x]; tokens.splice(x, 1);
+    }
   }
   return { tokens, comment, raw };
 }
@@ -140,6 +154,37 @@ const JUMP = new Set(["CALL","JC","JCN","JU","JZ","JN","JP","JM","JMZ","LOOP"]);
 const TIMERS = new Set(["SD","SF","SS","SP","SE"]);
 const TIMER_LABEL = { SD:"S_ODT (TON)", SF:"S_OFFDT (TOF)", SS:"S_ODTS", SP:"S_PULSE", SE:"S_PEXT" };
 const COUNTER_LABEL = { CU:"S_CU (CTU)", CD:"S_CD (CTD)" };
+
+// data-path operations that transform the accumulator -> rendered as function boxes.
+// n: arity (2 = ACCU2 op ACCU1, 1 = unary on ACCU1); sym: infix symbol for binary.
+const MATH_OPS = {
+  "+I":{t:"ADD_I",n:2,sym:"+"}, "-I":{t:"SUB_I",n:2,sym:"−"}, "*I":{t:"MUL_I",n:2,sym:"×"}, "/I":{t:"DIV_I",n:2,sym:"÷"},
+  "+D":{t:"ADD_DI",n:2,sym:"+"}, "-D":{t:"SUB_DI",n:2,sym:"−"}, "*D":{t:"MUL_DI",n:2,sym:"×"}, "/D":{t:"DIV_DI",n:2,sym:"÷"}, "MOD":{t:"MOD",n:2,sym:"mod"},
+  "+R":{t:"ADD_R",n:2,sym:"+"}, "-R":{t:"SUB_R",n:2,sym:"−"}, "*R":{t:"MUL_R",n:2,sym:"×"}, "/R":{t:"DIV_R",n:2,sym:"÷"},
+  "+":{t:"ADD",n:2,sym:"+"},
+  "AW":{t:"AND_W",n:2,sym:"AND"}, "OW":{t:"OR_W",n:2,sym:"OR"}, "XOW":{t:"XOR_W",n:2,sym:"XOR"},
+  "AD":{t:"AND_DW",n:2,sym:"AND"}, "OD":{t:"OR_DW",n:2,sym:"OR"}, "XOD":{t:"XOR_DW",n:2,sym:"XOR"},
+  "NEGI":{t:"NEG_I",n:1}, "NEGD":{t:"NEG_DI",n:1}, "NEGR":{t:"NEG_R",n:1},
+  "INVI":{t:"INV_I",n:1}, "INVD":{t:"INV_DI",n:1},
+  "ABS":{t:"ABS",n:1}, "SQR":{t:"SQR",n:1}, "SQRT":{t:"SQRT",n:1}, "EXP":{t:"EXP",n:1}, "LN":{t:"LN",n:1},
+  "SIN":{t:"SIN",n:1}, "COS":{t:"COS",n:1}, "TAN":{t:"TAN",n:1}, "ASIN":{t:"ASIN",n:1}, "ACOS":{t:"ACOS",n:1}, "ATAN":{t:"ATAN",n:1},
+  "BTI":{t:"BCD→INT",n:1}, "ITB":{t:"INT→BCD",n:1}, "BTD":{t:"BCD→DINT",n:1}, "ITD":{t:"INT→DINT",n:1},
+  "DTB":{t:"DINT→BCD",n:1}, "DTR":{t:"DINT→REAL",n:1}, "RND":{t:"ROUND",n:1}, "TRUNC":{t:"TRUNC",n:1}, "RND+":{t:"CEIL",n:1}, "RND-":{t:"FLOOR",n:1},
+  "SLW":{t:"SHL_W",n:1,sh:true}, "SRW":{t:"SHR_W",n:1,sh:true}, "SLD":{t:"SHL_DW",n:1,sh:true}, "SRD":{t:"SHR_DW",n:1,sh:true},
+  "SSI":{t:"SHR_I±",n:1,sh:true}, "SSD":{t:"SHR_DI±",n:1,sh:true}, "RLD":{t:"ROL_DW",n:1,sh:true}, "RRD":{t:"ROR_DW",n:1,sh:true}, "RLDA":{t:"ROL_A",n:1,sh:true}, "RRDA":{t:"ROR_A",n:1,sh:true},
+};
+// jump / loop family
+const JUMP_OPS = new Set(["JU","JC","JCN","JCB","JNB","JBI","JNBI","JO","JOS","JZ","JN","JP","JM","JPZ","JMZ","JUO","JL","LOOP"]);
+// every recognized STL mnemonic -> never reported as "unrecognized"
+const STL_KNOWN = new Set([
+  "A","AN","O","ON","X","XN","NOT","SET","CLR","SAVE","=","R","S","FP","FN","NEG","POS",
+  "L","LC","T","TAK","PUSH","POP","ENT","LEAVE","INC","DEC","BLD","NOP",
+  "SP","SE","SD","SS","SF","FR","CU","CD",
+  "MOD","CAW","CAD","CALL","CC","UC",
+  "LAR1","LAR2","TAR1","TAR2","LAR","TAR","CAR","+AR1","+AR2","+AR","TAW","TAD",
+  "OPN","OPNDI","CDB","BE","BEU","BEC","MCR","MCRA","MCRD",
+  ...Object.keys(MATH_OPS), ...JUMP_OPS,
+]);
 
 /* ============================================================= *
  *  PARSER  ->  networks -> rungs -> RungNode tree
@@ -218,11 +263,13 @@ function parseNetwork(net) {
     let logic = orReduce(top().or.concat([seriesOf(top().cur)]));
     return logic;
   };
-  const resetVKE = () => { frames = [{ or: [], cur: [] }]; opStack = []; lastLoad = null; };
+  const resetVKE = () => { frames = [{ or: [], cur: [] }]; opStack = []; lastLoad = null; accu1 = null; accu2 = null; accuOp = null; };
   const contact = (kind, operand, comment) => ({ type: "CONTACT", kind, operand: operand || "??", negated: kind === "NC", comment: comment || null });
 
   let pendingOutputs = [];
   let emitted = false; // true after a write op; the next bit-logic instruction starts a new rung
+  // lightweight accumulator model for the data path (L / math / T -> function boxes)
+  let accu1 = null, accu2 = null, accuOp = null; // accuOp = title of the op that produced accu1, or null (plain value)
 
   function flushRung() {
     if (pendingOutputs.length) {
@@ -242,7 +289,9 @@ function parseNetwork(net) {
   }
 
   for (const instr of net.instrs) {
-    const t = instr.tokens.filter(x => x !== ",");
+    let t = instr.tokens.filter(x => x !== ",");
+    // strip a leading jump label "NAME:" (e.g. LOOP1:) — it marks a jump target, not an instruction
+    if (t[0] && /^[A-Za-z_]\w*:$/.test(t[0])) t = t.slice(1);
     let m = t[0];
     if (!m) continue;
     const mUpper = m.toUpperCase();
@@ -294,33 +343,45 @@ function parseNetwork(net) {
         addOutput({ kind: "TIMER", timerType: mUpper, operand, preset: lastLoad }, cmt); break;
       case "CU": case "CD":
         addOutput({ kind: "COUNTER", counterType: mUpper, operand, preset: lastLoad }, cmt); break;
-      case "L":  lastLoad = operand; break;
+      case "L": case "LC":
+        accu2 = accu1; accu1 = disp(operand); accuOp = null; lastLoad = operand; break;
       case "T":
-        addOutput({ kind: "MOVE", src: lastLoad || "ACCU", dst: operand }, cmt); break;
-      case "CALL": {
+        if (accuOp) addOutput({ kind: "FUNC", title: accuOp, expr: accu1, dst: disp(operand) }, cmt);
+        else addOutput({ kind: "MOVE", src: accu1 || lastLoad || "ACCU", dst: disp(operand) }, cmt);
+        accu1 = null; accu2 = null; accuOp = null;
+        break;
+      case "CALL": case "CC": case "UC": {
         const parts = t.slice(1);
-        addOutput({ kind: "FBCALL", fb: parts[0] || "FB?", db: parts[1] || "" }, cmt);
+        addOutput({ kind: "FBCALL", fb: parts[0] || "FB", db: parts[1] || "" }, cmt);
         break;
       }
-      case "JC": case "JCN": case "JU": case "JZ": case "JN": case "JP": case "JM": case "LOOP":
-        warnings.push(`Network ${net.number}: jump "${mUpper} ${operand||""}" is shown as annotation (not graphically resolvable).`);
-        addOutput({ kind: "JUMP", op: mUpper, label: operand }, cmt); break;
       case "FR":
-        warnings.push(`Network ${net.number}: "FR ${operand||""}" (free/enable) annotated.`);
         addOutput({ kind: "BOX", title: "FR", operand }, cmt); break;
       case "NOT":
         top().cur.push({ type: "CONTACT", kind: "NOT", operand: "NOT" }); break;
-      case "SET": case "CLR": case "NOP":
+      case "OPN": case "OPNDI": case "CDB":
+        // open data block — sets DB context, no ladder element
         break;
-      case "BLD": case "BE": case "BEU": case "BEC":
+      case "SET": case "CLR": case "NOP": case "SAVE":
+        break;
+      case "BLD": case "BE": case "BEU": case "BEC": case "TAK": case "PUSH": case "POP": case "ENT": case "LEAVE":
         break;
       default:
-        // pointer / address-register ops — recognized, not graphically drawn (see Pointers help)
-        if (POINTER_OPS.has(mUpper)) {
-          break;
-        } else if (/^[<>=!]=?[IDR]?$/.test(m) || /^(==|<>|>=|<=|>|<)[IDR]?$/.test(m)) {
+        if (MATH_OPS[mUpper]) {
+          // data-path math/logic/convert/shift — transform the accumulator expression
+          const meta = MATH_OPS[mUpper];
+          if (meta.n === 2) accu1 = `${accu2 ?? "ACCU2"} ${meta.sym} ${accu1 ?? "ACCU1"}`;
+          else if (meta.sh) accu1 = `${meta.t}(${accu1 ?? "ACCU1"}${operand ? ", " + disp(operand) : ""})`;
+          else accu1 = `${meta.t}(${accu1 ?? "ACCU1"})`;
+          accuOp = meta.t;
+        } else if (JUMP_OPS.has(mUpper)) {
+          addOutput({ kind: "JUMP", op: mUpper, label: operand }, cmt);
+        } else if (/^(==|<>|>=|<=|>|<)[IDR]?$/.test(m) || /^[<>=!]=?[IDR]$/.test(m)) {
           // comparators like >=I  ==I etc
           top().cur.push({ type: "CONTACT", kind: "COMPARE", operand: m });
+        } else if (STL_KNOWN.has(mUpper)) {
+          // recognized STL op with no distinct ladder element (accumulator / control / register)
+          break;
         } else {
           warnings.push(`Network ${net.number}: unrecognized instruction "${m}".`);
         }
@@ -369,7 +430,7 @@ function Ladder({ networks, themeKey, zoom = 1, xlate }) {
     networks.forEach(net => {
       net.rungs.forEach((rung, ri) => {
         const m = measure(rung.logic);
-        const anyBox = (rung.outputs || []).some(o => ["TIMER","COUNTER","FBCALL","MOVE","JUMP","BOX"].includes(o.kind));
+        const anyBox = (rung.outputs || []).some(o => ["TIMER","COUNTER","FBCALL","MOVE","JUMP","BOX","FUNC"].includes(o.kind));
         const outW = anyBox ? BOX_W : SYM;
         const need = RAIL_L + 12 + m.w + 50 + outW + 12 + RAIL_L;
         rows.push({ net, rung, ri, mw: m.w, lanes: m.lanes, outW, need });
@@ -468,7 +529,8 @@ function Ladder({ networks, themeKey, zoom = 1, xlate }) {
     else if (out.kind === "COUNTER") { title = out.operand || "C?"; lines = [COUNTER_LABEL[out.counterType]||out.counterType, out.counterType==="CU"?"count up":"count down"]; }
     else if (out.kind === "FBCALL") { title = "CALL"; lines = [out.fb, out.db ? "DB "+out.db : ""]; }
     else if (out.kind === "MOVE") { title = "MOVE"; lines = ["IN "+disp(out.src), "OUT "+disp(out.dst)]; }
-    else if (out.kind === "JUMP") { title = out.op; lines = ["→ "+(disp(out.label)||"label"), "unsupported"]; }
+    else if (out.kind === "FUNC") { title = out.title; lines = [trunc(out.expr, 16), "= "+disp(out.dst)]; }
+    else if (out.kind === "JUMP") { title = out.op; lines = ["→ "+(disp(out.label)||"label"), "(control)"]; }
     else { title = out.title || "BOX"; lines = [disp(out.operand)]; }
     const jump = out.kind === "JUMP";
     els.push(<rect key={k()} className={jump?"jumpbox":"boxrect"} x={bx} y={top} width={bw} height={BOX_H} rx="5" />);
@@ -509,7 +571,7 @@ function Ladder({ networks, themeKey, zoom = 1, xlate }) {
     els.push(<rect key={k()} x={10} y={y+8} width={6} height={NET_HDR-14} rx={3} style={{ fill: nc }} />);
     els.push(<text key={k()} x={26} y={y+22} style={{ fill: nc, fontFamily: "Inter", fontSize: "13px", fontWeight: 700 }}>{"NETWORK " + net.number}</text>);
     if (net.title) els.push(<text key={k()} className="netsub" x={26} y={y+39}>{net.title}</text>);
-    if (net.hasUnsupported) els.push(<text key={k()} className="netsub" x={width-16} y={y+22} textAnchor="end" style={{fill:"var(--amber)"}}>⚠ check warnings</text>);
+    if (net.hasUnsupported) els.push(<text key={k()} className="netsub" x={width-16} y={y+22} textAnchor="end" style={{fill:"var(--amber)"}}>⚠ contains annotations</text>);
     if (ins.length) els.push(<text key={k()} className="iolab-i" x={26} y={y+59}>{"IN ▸ " + trunc(ins.join(", "), 52)}</text>);
     if (outs.length) els.push(<text key={k()} className="iolab-q" x={width-16} y={y+59} textAnchor="end">{"OUT ▸ " + trunc(outs.join(", "), 40)}</text>);
     y += NET_HDR;
@@ -517,7 +579,7 @@ function Ladder({ networks, themeKey, zoom = 1, xlate }) {
     net.rungs.forEach(rung => {
       const m = measure(rung.logic);
       const outputs = rung.outputs || [];
-      const isBox = (o) => ["TIMER","COUNTER","FBCALL","MOVE","JUMP","BOX"].includes(o.kind);
+      const isBox = (o) => ["TIMER","COUNTER","FBCALL","MOVE","JUMP","BOX","FUNC"].includes(o.kind);
       const anyBox = outputs.some(isBox);
       const outW = anyBox ? BOX_W : SYM;
       const laneCount = Math.max(m.lanes, Math.max(1, outputs.length));
@@ -725,8 +787,75 @@ const POINTER_REF = [
     ],
   },
 ];
-// mnemonics treated as pointer / address-register ops (recognized, not graphically drawn)
-const POINTER_OPS = new Set(["AR1", "AR2", "LAR1", "LAR2", "TAR1", "TAR2", "LAR", "TAR", "CAR", "+AR1", "+AR2", "+AR", "TAW", "TAD"]);
+
+// Full S7 STL master reference — every instruction family, shown in the Help modal.
+const STL_FULL_REF = [
+  { group: "Bit logic (→ contacts)", items: [
+    { mn: "A / AN", name: "AND / AND-NOT", desc: "Series contact — normally open / normally closed.", ex: "A I0.0   AN I0.1" },
+    { mn: "O / ON", name: "OR / OR-NOT", desc: "Parallel branch — NO / NC contact.", ex: "O M5.0" },
+    { mn: "X / XN", name: "XOR / XOR-NOT", desc: "Exclusive-OR the operand into the logic result.", ex: "X I0.2" },
+    { mn: "A( … )", name: "Nested bracket", desc: "Group a sub-expression; the whole group acts as one contact. Also O(, AN(, ON(.", ex: "A( O I0.0 O I0.1 )" },
+    { mn: "NOT", name: "Negate RLO", desc: "Invert the current logic result (VKE/RLO).", ex: "NOT" },
+    { mn: "SET / CLR", name: "Force RLO", desc: "Set the logic result to 1 / 0 unconditionally.", ex: "SET" },
+    { mn: "SAVE", name: "Save RLO", desc: "Copy RLO to the BR status bit.", ex: "SAVE" },
+  ]},
+  { group: "Outputs (→ coils)", items: [
+    { mn: "=", name: "Assign", desc: "Write the logic result to the operand — output coil ─( )─.", ex: "= Q0.0" },
+    { mn: "S", name: "Set (latch)", desc: "Latch operand to 1 while RLO is 1 — ─(S)─. VKE persists to following writes.", ex: "S M10.0" },
+    { mn: "R", name: "Reset (unlatch)", desc: "Reset operand to 0 while RLO is 1 — ─(R)─.", ex: "R M10.0" },
+    { mn: "FP / FN", name: "Rising / falling edge", desc: "One-scan pulse on 0→1 / 1→0 edge; operand stores the edge-memory bit. Drawn as ─┤P├─ / ─┤N├─.", ex: "A I0.0  FP M1.0  = Q0.5" },
+  ]},
+  { group: "Timers (→ timer boxes)", items: [
+    { mn: "SD", name: "On-delay (S_ODT / TON)", desc: "Output true after preset elapses. Preset via L S5T#…", ex: "L S5T#5S  SD T1" },
+    { mn: "SF", name: "Off-delay (S_OFFDT / TOF)", desc: "Output stays true for the preset after input drops.", ex: "L S5T#10S  SF T2" },
+    { mn: "SS", name: "Retentive on-delay (S_ODTS)", desc: "Keeps elapsed time when input drops; reset with R T.", ex: "SS T3" },
+    { mn: "SP", name: "Pulse (S_PULSE)", desc: "Output pulse of preset length while input holds.", ex: "SP T4" },
+    { mn: "SE", name: "Extended pulse (S_PEXT)", desc: "Full-length pulse even if input drops early.", ex: "SE T5" },
+    { mn: "FR", name: "Free / enable", desc: "Re-enable a timer or counter for restart on next edge.", ex: "FR T1" },
+  ]},
+  { group: "Counters (→ counter boxes)", items: [
+    { mn: "CU / CD", name: "Count up / down", desc: "Increment / decrement on a rising edge of RLO.", ex: "CU C1   CD C1" },
+    { mn: "S C / R C", name: "Preset / reset counter", desc: "S loads the preset (L C#n first); R clears to 0.", ex: "L C#10  S C1" },
+    { mn: "L / LC C", name: "Read count", desc: "Load counter value binary (L) or BCD (LC) into ACCU 1.", ex: "L C1  T MW10" },
+  ]},
+  { group: "Load / Transfer (→ MOVE boxes)", items: [
+    { mn: "L", name: "Load", desc: "Load value into ACCU 1 (previous ACCU 1 shifts to ACCU 2).", ex: "L MW10   L 25   L S5T#5S" },
+    { mn: "T", name: "Transfer", desc: "Store ACCU 1 to the operand — drawn as a MOVE (or math) box.", ex: "T MW100" },
+    { mn: "LC", name: "Load BCD", desc: "Load timer/counter value in BCD form.", ex: "LC T1" },
+    { mn: "TAK / PUSH / POP / ENT / LEAVE", name: "Accumulator stack", desc: "Swap ACCU1↔ACCU2 / rotate the accumulator stack.", ex: "TAK" },
+    { mn: "INC / DEC", name: "Increment / decrement", desc: "Add / subtract an 8-bit constant to ACCU 1 low byte.", ex: "INC 1" },
+    { mn: "CAW / CAD", name: "Swap byte order", desc: "Reverse bytes in ACCU 1 word / doubleword.", ex: "CAW" },
+  ]},
+  { group: "Math & word logic (→ function boxes)", items: [
+    { mn: "+I −I *I /I", name: "Integer math (16-bit)", desc: "ACCU2 op ACCU1 → ACCU1. Drawn as ADD_I / SUB_I / MUL_I / DIV_I box on transfer.", ex: "L MW0  L MW2  +I  T MW4" },
+    { mn: "+D −D *D /D MOD", name: "Double-integer math (32-bit)", desc: "Same for DINT; MOD gives the division remainder.", ex: "L MD0  L MD4  +D  T MD8" },
+    { mn: "+R −R *R /R", name: "Real (floating-point) math", desc: "32-bit IEEE-754 REAL arithmetic.", ex: "L MD10  L MD14  *R  T MD18" },
+    { mn: "ABS SQR SQRT EXP LN SIN COS TAN …", name: "Float functions", desc: "Unary functions on ACCU 1 (REAL).", ex: "L MD20  SQRT  T MD24" },
+    { mn: "AW OW XOW / AD OD XOD", name: "Word logic", desc: "Bitwise AND / OR / XOR on word (W) or doubleword (D).", ex: "L MW0  L W#16#00FF  AW  T MW2" },
+    { mn: "NEGI NEGD NEGR / INVI INVD", name: "Negate / invert", desc: "Two's complement / one's complement of ACCU 1.", ex: "L MW0  NEGI  T MW2" },
+    { mn: "SLW SRW SLD SRD SSI SSD RLD RRD", name: "Shift / rotate", desc: "Shift or rotate ACCU 1 by N bits (operand or ACCU 2).", ex: "L MW0  SLW 4  T MW2" },
+    { mn: "BTI ITB BTD DTB DTR ITD RND TRUNC", name: "Conversions", desc: "BCD↔INT↔DINT↔REAL conversions and rounding.", ex: "L MW0  ITB  T MW2" },
+  ]},
+  { group: "Compare (→ compare contacts)", items: [
+    { mn: "==I <>I >I <I >=I <=I", name: "Integer compare", desc: "Compare ACCU 2 with ACCU 1; result becomes the RLO — acts like a contact.", ex: "L MW0  L 100  >I  = Q0.0" },
+    { mn: "==D <>D … / ==R <>R …", name: "DINT / REAL compare", desc: "Same comparisons for 32-bit integer and floating point.", ex: "L MD0  L MD4  >=R" },
+  ]},
+  { group: "Jumps & control (→ annotations)", items: [
+    { mn: "LABEL:", name: "Jump label", desc: "A name ending in ':' marks a jump target line.", ex: "NEXT: L MW0" },
+    { mn: "JU / JC / JCN", name: "Jump always / if RLO=1 / if RLO=0", desc: "Branch to a label. Not drawable as pure ladder — shown as a dashed annotation box.", ex: "JC NEXT" },
+    { mn: "JCB JNB JBI JNBI JO JOS", name: "Status-bit jumps", desc: "Jump on BR / OV / OS status bits.", ex: "JO ERR" },
+    { mn: "JZ JN JP JM JPZ JMZ JUO", name: "Result jumps", desc: "Jump on ACCU 1 compared to zero (=0, ≠0, >0, <0, ≥0, ≤0, invalid).", ex: "JZ ZERO" },
+    { mn: "LOOP", name: "Loop", desc: "Decrement ACCU 1 and jump to the label while it is > 0.", ex: "L 10  T MW100 … LOOP LOOP1" },
+    { mn: "MCR( )MCR MCRA MCRD", name: "Master Control Relay", desc: "Zone control — outputs inside an active MCR zone are forced off.", ex: "MCRA  MCR(  …  )MCR" },
+  ]},
+  { group: "Blocks & data blocks", items: [
+    { mn: "CALL / CC / UC", name: "Call block", desc: "Call FB/FC/SFC — conditional (CC) or unconditional (UC/CALL). Drawn as a call box.", ex: "CALL FB10, DB10" },
+    { mn: "OPN", name: "Open data block", desc: "Open a DB (DB register) or instance DB (DI register) — sets the context for DBX/DBW access.", ex: "OPN DB10" },
+    { mn: "CDB", name: "Exchange DB registers", desc: "Swap the DB and DI registers.", ex: "CDB" },
+    { mn: "BE / BEU / BEC", name: "Block end", desc: "End block — unconditional (BEU) or conditional on RLO (BEC).", ex: "BEC" },
+  ]},
+  ...POINTER_REF.map(g => ({ ...g, group: "Pointers — " + g.group })),
+];
 
 function HighlightedCode({ code, lineNet }) {
   const lines = code.split("\n");
@@ -967,19 +1096,19 @@ function HelpModal({ onClose }) {
     <div className="fixed inset-0 z-[80] flex items-center justify-center p-4" style={{ background: "rgba(0,0,0,.62)", backdropFilter: "blur(2px)" }} onClick={onClose}>
       <div className="w-full max-w-2xl rounded-2xl overflow-hidden flex flex-col anim-in" style={{ background: "var(--panel)", border: "1px solid var(--border)", maxHeight: "92vh" }} onClick={e => e.stopPropagation()}>
         <div className="flex items-center justify-between px-5 py-3" style={{ borderBottom: "1px solid var(--border)" }}>
-          <div className="flex items-center gap-2 font-bold"><span style={{ color: "var(--accent)" }}><Ico d={I.help} /></span>STL Pointers &amp; Indirect Addressing</div>
+          <div className="flex items-center gap-2 font-bold"><span style={{ color: "var(--accent)" }}><Ico d={I.help} /></span>STL Master Reference</div>
           <button className="btn !px-2 !py-1" onClick={onClose}><Ico d={I.x} /></button>
         </div>
         <div className="px-5 pt-3">
           <p className="text-xs mb-3" style={{ color: "var(--muted)" }}>
-            Pointers let STL address operands indirectly — computed at runtime via the address registers <span className="mono t-bool">AR1 / AR2</span> and
-            <span className="mono"> P#</span> pointer constants. These manipulate registers/addresses, not the rung logic, so the converter recognizes them but doesn't draw a ladder symbol.
+            The complete S7 STL instruction set and how each maps to ladder: bit logic → contacts, outputs → coils, timers/counters → boxes,
+            math &amp; data moves → function boxes, jumps/pointers → annotations (they have no graphical LAD form — Siemens STEP 7 shows the same).
           </p>
-          <input value={q} onChange={e => setQ(e.target.value)} placeholder="Search pointers…" className="mono w-full"
+          <input value={q} onChange={e => setQ(e.target.value)} placeholder="Search instructions… (e.g. LAR1, +I, OPN, LOOP)" className="mono w-full"
             style={{ padding: "9px 12px", borderRadius: 9, border: "1px solid var(--border)", background: "var(--editorbg)", color: "var(--text)", fontSize: 13, outline: "none", boxSizing: "border-box" }} />
         </div>
         <div className="px-5 py-3 overflow-auto">
-          {POINTER_REF.map(grp => {
+          {STL_FULL_REF.map(grp => {
             const items = grp.items.filter(match);
             if (!items.length) return null;
             return (
@@ -987,12 +1116,12 @@ function HelpModal({ onClose }) {
                 <div className="text-xs font-bold uppercase tracking-wider mb-1" style={{ color: "var(--accent)" }}>{grp.group}</div>
                 {items.map(it => (
                   <div key={it.mn} className="flex items-start gap-3 py-2" style={{ borderBottom: "1px solid var(--border)" }}>
-                    <span className="mono t-bool" style={{ fontWeight: 700, minWidth: 92, fontSize: 13.5 }}>{it.mn}</span>
+                    <span className="mono t-bool" style={{ fontWeight: 700, width: 110, flexShrink: 0, fontSize: 12.5, wordBreak: "break-word" }}>{it.mn}</span>
                     <div style={{ flex: 1 }}>
                       <div style={{ fontWeight: 600, fontSize: 13 }}>{it.name}</div>
                       <div style={{ fontSize: 12.5, color: "var(--muted)" }}>{it.desc}</div>
                     </div>
-                    {it.ex && <span className="mono" style={{ fontSize: 11, color: "var(--operand)", whiteSpace: "nowrap", paddingTop: 2 }}>{it.ex}</span>}
+                    {it.ex && <span className="mono" style={{ fontSize: 11, color: "var(--operand)", maxWidth: 170, textAlign: "right", paddingTop: 2 }}>{it.ex}</span>}
                   </div>
                 ))}
               </div>
@@ -1209,7 +1338,7 @@ function App() {
         </div>
         <button className="btn btn-primary" onClick={() => setDebounced(code)}><Ico d={I.play}/>Convert</button>
         <button className="btn" onClick={() => setScanOpen(true)}><Ico d={I.camera}/>Scan</button>
-        <button className="btn" title="STL pointers & indirect addressing help" onClick={() => setHelpOpen(true)}><Ico d={I.help}/>Pointers</button>
+        <button className="btn" title="Full STL instruction reference (incl. pointers & indirect addressing)" onClick={() => setHelpOpen(true)}><Ico d={I.help}/>STL Help</button>
         <button className="btn" onClick={() => setCode("")}><Ico d={I.trash}/>Clear</button>
         <select value="" onChange={(e) => { if (e.target.value) setCode(EXAMPLES[e.target.value].code); }}>
           <option value="">📂 Load Example…</option>
