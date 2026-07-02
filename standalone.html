@@ -73,6 +73,15 @@
   .addr-m{fill:var(--purple);font-family:'JetBrains Mono';font-size:10px;font-weight:700}
   .iolab-i{fill:var(--accent);font-family:'JetBrains Mono';font-size:11px;font-weight:600}
   .iolab-q{fill:var(--green);font-family:'JetBrains Mono';font-size:11px;font-weight:600}
+
+  /* simulation: energized elements */
+  .live{stroke:#2dff8f !important;filter:drop-shadow(0 0 3px rgba(45,255,143,.75))}
+  .livefill{fill:#2dff8f;filter:drop-shadow(0 0 3px rgba(45,255,143,.75))}
+  .liveborder{stroke:#2dff8f !important;filter:drop-shadow(0 0 3px rgba(45,255,143,.55))}
+  .simval{fill:#2dff8f;font-family:'JetBrains Mono';font-size:11px;font-weight:700}
+  .light .live,.light .liveborder{stroke:#059646 !important;filter:none}
+  .light .livefill{fill:#059646;filter:none}
+  .light .simval{fill:#059646}
   .symtext{fill:var(--accent);font-weight:700;font-size:13px;font-family:'JetBrains Mono'}
   .coiltext{fill:var(--green);font-weight:700;font-size:13px;font-family:'JetBrains Mono'}
   .coiltext-sr{fill:var(--amber);font-weight:700;font-size:13px;font-family:'JetBrains Mono'}
@@ -524,7 +533,146 @@ function measure(n) {
   return { w: SYM, lanes: 1 };
 }
 
-function Ladder({ networks, themeKey, zoom = 1, xlate }) {
+/* ============================================================= *
+ *  SIMULATION ENGINE — cyclic scan of the parsed program.
+ *  Logic-level model (contacts, coils, S/R, edges, timers, counters,
+ *  compares as forceable conditions). MOVE/math/jumps are no-ops.
+ * ============================================================= */
+function parseS5T(s) {
+  const m = String(s || "").toUpperCase().match(/(?:S5T|T)#(.+)/);
+  if (!m) return 3000;
+  let ms = 0, mm;
+  const re = /(\d+(?:\.\d+)?)(MS|S|M|H|D)/g;
+  while ((mm = re.exec(m[1]))) ms += parseFloat(mm[1]) * { MS: 1, S: 1000, M: 60000, H: 3600000, D: 86400000 }[mm[2]];
+  return ms || 3000;
+}
+const simKeyOf = (op) => disp(op).toUpperCase();
+// which bit a click on a contact toggles
+function simToggleKey(n) {
+  if (!n) return null;
+  if (n.kind === "COMPARE") return "CMP " + n.operand;
+  if (["NO", "NC", "XOR"].includes(n.kind)) return simKeyOf(n.operand);
+  return null; // NOT / edge contacts are not forceable
+}
+function createSimMemory() {
+  return { bits: {}, edges: {}, pulses: {}, timers: {}, counters: {}, cnEdges: {} };
+}
+const simBit = (mem, op) => !!mem.bits[simKeyOf(op)];
+
+// Evaluate a logic tree as an RLO chain. scan=true updates edge memories;
+// scan=false (render pass) reuses the pulses captured by the last scan.
+function evalChain(children, mem, scan, startVal) {
+  let v = startVal;
+  for (const c of children) {
+    if (c.type === "CONTACT") {
+      if (c.kind === "NOT") v = !v;
+      else if (c.kind === "XOR") v = (v !== (c.xn ? !simBit(mem, c.operand) : simBit(mem, c.operand)));
+      else if (c.kind === "PEDGE" || c.kind === "NEDGE") {
+        const key = simKeyOf(c.operand);
+        if (scan) {
+          const prev = !!mem.edges[key];
+          mem.edges[key] = v;
+          v = c.kind === "PEDGE" ? (v && !prev) : (!v && prev);
+          mem.pulses[key] = v;
+        } else v = !!mem.pulses[key];
+      }
+      else if (c.kind === "COMPARE") { const cv = !!mem.bits["CMP " + c.operand]; v = v && cv; }
+      else if (c.kind === "NC") { const cv = !simBit(mem, c.operand); v = v && cv; }
+      else { const cv = simBit(mem, c.operand); v = v && cv; }
+    } else if (c.type === "SERIES") {
+      v = evalChain(c.children, mem, scan, v);
+    } else if (c.type === "PARALLEL") {
+      let pv = false;
+      for (const b of c.children) { const bv = evalRungLogic(b, mem, scan); pv = pv || bv; }
+      v = v && pv;
+    }
+  }
+  return v;
+}
+function evalRungLogic(root, mem, scan) {
+  if (!root) return true; // bare rail
+  if (root.type === "PARALLEL") {
+    let pv = false;
+    for (const b of root.children) { const bv = evalRungLogic(b, mem, scan); pv = pv || bv; }
+    return pv;
+  }
+  return evalChain(root.type === "SERIES" ? root.children : [root], mem, scan, true);
+}
+
+function updateSimTimer(mem, key, o, rlo, now) {
+  const preset = parseS5T(o.preset);
+  const t = mem.timers[key] || (mem.timers[key] = { prevIn: false, startAt: 0, running: false, out: false });
+  t.preset = preset; t.type = o.timerType;
+  const rise = rlo && !t.prevIn, fall = !rlo && t.prevIn;
+  const el = () => now - t.startAt; // must be read AFTER edge handling resets startAt
+  switch (o.timerType) {
+    case "SD": // on-delay (TON)
+      if (rise) { t.running = true; t.startAt = now; }
+      if (!rlo) { t.running = false; t.out = false; }
+      else if (t.running && el() >= preset) { t.out = true; t.running = false; }
+      break;
+    case "SS": // retentive on-delay
+      if (rise) { t.running = true; t.startAt = now; }
+      if (t.running && el() >= preset) { t.out = true; t.running = false; }
+      break;
+    case "SF": // off-delay (TOF)
+      if (rlo) { t.out = true; t.running = false; }
+      else {
+        if (fall) { t.running = true; t.startAt = now; }
+        if (t.running && el() >= preset) { t.out = false; t.running = false; }
+      }
+      break;
+    case "SP": // pulse
+      if (rise) { t.running = true; t.startAt = now; }
+      if (!rlo) t.running = false;
+      t.out = t.running && el() < preset;
+      break;
+    case "SE": // extended pulse
+      if (rise) { t.running = true; t.startAt = now; }
+      if (t.running && el() >= preset) t.running = false;
+      t.out = t.running;
+      break;
+    default: break;
+  }
+  t.prevIn = rlo;
+  t.remaining = t.running ? Math.max(0, preset - el()) : 0;
+  mem.bits[key] = !!t.out;
+}
+function updateSimCounter(mem, key, o, rlo) {
+  const c = mem.counters[key] || (mem.counters[key] = { count: 0 });
+  const ek = key + ":" + o.counterType;
+  if (rlo && !mem.cnEdges[ek]) {
+    c.count = o.counterType === "CU" ? Math.min(999, c.count + 1) : Math.max(0, c.count - 1);
+  }
+  mem.cnEdges[ek] = rlo;
+  mem.bits[key] = c.count > 0;
+}
+
+// one PLC scan cycle over the whole parsed program
+function simScan(networks, mem, now) {
+  networks.forEach(net => net.rungs.forEach(rung => {
+    const rlo = evalRungLogic(rung.logic, mem, true);
+    (rung.outputs || []).forEach(o => {
+      const key = o.operand ? simKeyOf(o.operand) : null;
+      switch (o.kind) {
+        case "COIL": if (key) mem.bits[key] = rlo; break;
+        case "SET": if (rlo && key) mem.bits[key] = true; break;
+        case "RESET":
+          if (rlo && key) {
+            mem.bits[key] = false;
+            if (mem.timers[key]) { mem.timers[key].out = false; mem.timers[key].running = false; }
+            if (mem.counters[key]) mem.counters[key].count = 0;
+          }
+          break;
+        case "TIMER": if (key) updateSimTimer(mem, key, o, rlo, now); break;
+        case "COUNTER": if (key) updateSimCounter(mem, key, o, rlo); break;
+        default: break; // MOVE / FUNC / JUMP / FBCALL / BOX not simulated
+      }
+    });
+  }));
+}
+
+function Ladder({ networks, themeKey, zoom = 1, xlate, sim }) {
   const tr = (c) => (xlate && c && xlate[c]) ? xlate[c] : c;
   // first pass: compute width needed per rung
   const layout = useMemo(() => {
@@ -563,84 +711,146 @@ function Ladder({ networks, themeKey, zoom = 1, xlate }) {
     }
   }
 
-  function drawContact(n, x, cy) {
+  // wire class helper: bright green when carrying simulated power
+  const wcls = (p) => "wire" + (sim && p ? " live" : "");
+  // is this contact "closed" (conducting if power arrives)?
+  function contactClosed(n) {
+    if (!sim) return false;
+    const mem = sim.mem;
+    switch (n.kind) {
+      case "NO": return simBit(mem, n.operand);
+      case "NC": return !simBit(mem, n.operand);
+      case "XOR": return n.xn ? !simBit(mem, n.operand) : simBit(mem, n.operand);
+      case "COMPARE": return !!mem.bits["CMP " + n.operand];
+      case "PEDGE": case "NEDGE": return !!mem.pulses[simKeyOf(n.operand)];
+      default: return false;
+    }
+  }
+  function pushClickZone(n, x, cy) {
+    if (!sim || !simToggleKey(n)) return;
+    els.push(<rect key={k()} x={x} y={cy-34} width={SYM} height={68} fill="rgba(0,0,0,0)"
+      style={{ cursor: "pointer", pointerEvents: "all" }} onClick={() => sim.onToggle(n)} />);
+  }
+
+  function drawContact(n, x, cy, pw, out) {
     const b1 = x + 26, b2 = x + 54, tp = cy - 16, bt = cy + 16;
-    els.push(<line key={k()} className="wire" x1={x} y1={cy} x2={b1} y2={cy} />);
-    els.push(<line key={k()} className="wire" x1={b2} y1={cy} x2={x + SYM} y2={cy} />);
+    els.push(<line key={k()} className={wcls(pw)} x1={x} y1={cy} x2={b1} y2={cy} />);
+    els.push(<line key={k()} className={wcls(out)} x1={b2} y1={cy} x2={x + SYM} y2={cy} />);
+    const closed = sim ? contactClosed(n) : false;
     if (n.kind === "COMPARE" || n.kind === "NOT") {
-      els.push(<rect key={k()} className="boxrect" x={x+18} y={cy-18} width={SYM-36} height={36} rx="3" />);
+      els.push(<rect key={k()} className={"boxrect" + (sim && closed && n.kind === "COMPARE" ? " liveborder" : "")} x={x+18} y={cy-18} width={SYM-36} height={36} rx="3" />);
       els.push(<text key={k()} className="symtext" x={x+SYM/2} y={cy+4} textAnchor="middle">{n.operand}</text>);
       drawIODetail(n.operand, tr(n.comment), x+SYM/2, cy+32);
+      pushClickZone(n, x, cy);
       return;
     }
-    els.push(<line key={k()} className="contact" x1={b1} y1={tp} x2={b1} y2={bt} />);
-    els.push(<line key={k()} className="contact" x1={b2} y1={tp} x2={b2} y2={bt} />);
-    if (n.kind === "NC") els.push(<line key={k()} className="contact" x1={b1-5} y1={bt} x2={b2+5} y2={tp} />);
+    const ccls = "contact" + (sim && closed ? " live" : "");
+    els.push(<line key={k()} className={ccls} x1={b1} y1={tp} x2={b1} y2={bt} />);
+    els.push(<line key={k()} className={ccls} x1={b2} y1={tp} x2={b2} y2={bt} />);
+    if (n.kind === "NC") els.push(<line key={k()} className={ccls} x1={b1-5} y1={bt} x2={b2+5} y2={tp} />);
     if (n.kind === "XOR") els.push(<text key={k()} className="symtext" x={(b1+b2)/2} y={cy+5} textAnchor="middle">{n.xn ? "X̄" : "X"}</text>);
     if (n.kind === "PEDGE" || n.kind === "NEDGE") els.push(<text key={k()} className="symtext" x={(b1+b2)/2} y={cy+5} textAnchor="middle">{n.kind === "PEDGE" ? "P" : "N"}</text>);
     const nm = disp(n.operand);
     els.push(<text key={k()} className={isAddr(nm) ? addrClass(nm) : "operand"} x={(b1+b2)/2} y={tp-8} textAnchor="middle">{nm}</text>);
+    if (sim && ["NO","NC","XOR"].includes(n.kind)) {
+      const on = simBit(sim.mem, n.operand);
+      els.push(<circle key={k()} cx={(b1+b2)/2} cy={bt+8} r={3.5} className={on ? "livefill" : ""} style={on ? {} : { fill: "var(--border)" }} />);
+    }
     drawIODetail(n.operand, tr(n.comment), (b1+b2)/2, cy+32);
+    pushClickZone(n, x, cy);
   }
 
-  function renderNode(n, x, cy) {
-    if (!n) { els.push(<line key={k()} className="wire" x1={x} y1={cy} x2={x+70} y2={cy} />); return x+70; }
-    if (n.type === "CONTACT") { drawContact(n, x, cy); return x + SYM; }
-    if (n.type === "SERIES") { let cx = x; n.children.forEach(c => { cx = renderNode(c, cx, cy); }); return cx; }
+  // returns { x: xEnd, out: power leaving this node } — out is null when sim is off
+  function renderNode(n, x, cy, pw) {
+    if (!n) { els.push(<line key={k()} className={wcls(pw)} x1={x} y1={cy} x2={x+70} y2={cy} />); return { x: x+70, out: pw }; }
+    if (n.type === "CONTACT") {
+      let out = pw;
+      if (sim) {
+        if (n.kind === "NOT") out = !pw;
+        else if (n.kind === "XOR") out = (pw !== contactClosed(n));
+        else out = pw && contactClosed(n);
+      }
+      drawContact(n, x, cy, pw, out);
+      return { x: x + SYM, out };
+    }
+    if (n.type === "SERIES") {
+      let cx = x, p = pw;
+      n.children.forEach(c => { const r = renderNode(c, cx, cy, p); cx = r.x; p = r.out; });
+      return { x: cx, out: p };
+    }
     if (n.type === "PARALLEL") {
       const m = measure(n); const bw = m.w;
       let laneTop = cy - (m.lanes * LANE_H) / 2;
       const centers = [];
+      let anyOut = sim ? false : null;
       n.children.forEach(c => {
         const cm = measure(c);
         const ccy = laneTop + (cm.lanes * LANE_H) / 2;
         centers.push(ccy);
-        const xe = renderNode(c, x, ccy);
-        if (xe < x + bw) els.push(<line key={k()} className="wire" x1={xe} y1={ccy} x2={x+bw} y2={ccy} />);
+        const r = renderNode(c, x, ccy, pw);
+        if (sim) anyOut = anyOut || r.out;
+        if (r.x < x + bw) els.push(<line key={k()} className={wcls(r.out)} x1={r.x} y1={ccy} x2={x+bw} y2={ccy} />);
         laneTop += cm.lanes * LANE_H;
       });
       const yT = centers[0], yB = centers[centers.length-1];
-      els.push(<line key={k()} className="wire" x1={x} y1={yT} x2={x} y2={yB} />);
-      els.push(<line key={k()} className="wire" x1={x+bw} y1={yT} x2={x+bw} y2={yB} />);
-      return x + bw;
+      els.push(<line key={k()} className={wcls(pw)} x1={x} y1={yT} x2={x} y2={yB} />);
+      els.push(<line key={k()} className={wcls(anyOut)} x1={x+bw} y1={yT} x2={x+bw} y2={yB} />);
+      return { x: x + bw, out: sim ? (pw && anyOut) : null };
     }
-    return x;
+    return { x, out: pw };
   }
 
-  function drawCoil(out, x, cy) {
+  function drawCoil(out, x, cy, rlo) {
     const a = x + 26, b = x + 56;
-    els.push(<line key={k()} className="wire" x1={x} y1={cy} x2={a} y2={cy} />);
-    els.push(<line key={k()} className="wire" x1={b} y1={cy} x2={x+SYM} y2={cy} />);
+    // energized: "=" coils show their bit state; S/R/edge coils show the acting RLO
+    const hot = sim ? (out.kind === "COIL" ? simBit(sim.mem, out.operand) : !!rlo) : false;
+    els.push(<line key={k()} className={wcls(rlo)} x1={x} y1={cy} x2={a} y2={cy} />);
+    els.push(<line key={k()} className={wcls(hot)} x1={b} y1={cy} x2={x+SYM} y2={cy} />);
     const sr = out.kind !== "COIL";
-    const cls = sr ? "coil-sr" : "coil";
+    const cls = (sr ? "coil-sr" : "coil") + (hot ? " live" : "");
     els.push(<path key={k()} className={cls} d={`M ${a} ${cy-17} Q ${a-13} ${cy} ${a} ${cy+17}`} />);
     els.push(<path key={k()} className={cls} d={`M ${b} ${cy-17} Q ${b+13} ${cy} ${b} ${cy+17}`} />);
     const letter = { SET:"S", RESET:"R", PEDGE:"P", NEDGE:"N" }[out.kind];
     if (letter) els.push(<text key={k()} className={sr?"coiltext-sr":"coiltext"} x={(a+b)/2} y={cy+5} textAnchor="middle">{letter}</text>);
     const nm = disp(out.operand);
     els.push(<text key={k()} className={isAddr(nm) ? addrClass(nm) : "operand"} x={(a+b)/2} y={cy-24} textAnchor="middle">{nm}</text>);
-    drawIODetail(out.operand, tr(out.comment), (a+b)/2, cy+32);
+    if (sim) {
+      const on = simBit(sim.mem, out.operand);
+      els.push(<circle key={k()} cx={(a+b)/2} cy={cy+24} r={3.5} className={on ? "livefill" : ""} style={on ? {} : { fill: "var(--border)" }} />);
+    }
+    drawIODetail(out.operand, tr(out.comment), (a+b)/2, cy+36);
   }
 
-  function drawBox(out, x, cy) {
+  function drawBox(out, x, cy, rlo) {
     const bx = x + 14, bw = BOX_W - 28, top = cy - BOX_H/2;
-    els.push(<line key={k()} className="wire" x1={x} y1={cy} x2={bx} y2={cy} />);
-    els.push(<line key={k()} className="wire" x1={bx+bw} y1={cy} x2={x+BOX_W} y2={cy} />);
-    let title = "", lines = [];
-    if (out.kind === "TIMER") { title = out.operand || "T?"; lines = [TIMER_LABEL[out.timerType]||out.timerType, out.preset ? "PT "+disp(out.preset) : ""]; }
-    else if (out.kind === "COUNTER") { title = out.operand || "C?"; lines = [COUNTER_LABEL[out.counterType]||out.counterType, out.counterType==="CU"?"count up":"count down"]; }
+    const key = out.operand ? simKeyOf(out.operand) : null;
+    const hot = sim && key ? !!sim.mem.bits[key] : false;
+    els.push(<line key={k()} className={wcls(rlo)} x1={x} y1={cy} x2={bx} y2={cy} />);
+    els.push(<line key={k()} className={wcls(hot)} x1={bx+bw} y1={cy} x2={x+BOX_W} y2={cy} />);
+    let title = "", lines = [], simLine = null;
+    if (out.kind === "TIMER") {
+      title = out.operand || "T?"; lines = [TIMER_LABEL[out.timerType]||out.timerType, out.preset ? "PT "+disp(out.preset) : ""];
+      const t = sim && key ? sim.mem.timers[key] : null;
+      if (sim) simLine = t ? (t.running ? "⏱ " + (t.remaining/1000).toFixed(1) + "s" : (t.out ? "DONE" : "idle")) : "idle";
+    }
+    else if (out.kind === "COUNTER") {
+      title = out.operand || "C?"; lines = [COUNTER_LABEL[out.counterType]||out.counterType, out.counterType==="CU"?"count up":"count down"];
+      const c = sim && key ? sim.mem.counters[key] : null;
+      if (sim) simLine = "CV = " + (c ? c.count : 0);
+    }
     else if (out.kind === "FBCALL") { title = "CALL"; lines = [out.fb, out.db ? "DB "+out.db : ""]; }
     else if (out.kind === "MOVE") { title = "MOVE"; lines = ["IN "+disp(out.src), "OUT "+disp(out.dst)]; }
     else if (out.kind === "FUNC") { title = out.title; lines = [trunc(out.expr, 16), "= "+disp(out.dst)]; }
-    else if (out.kind === "JUMP") { title = out.op; lines = ["→ "+(disp(out.label)||"label"), "(control)"]; }
+    else if (out.kind === "JUMP") { title = out.op; lines = ["→ "+(disp(out.label)||"label"), sim ? "not simulated" : "(control)"]; }
     else { title = out.title || "BOX"; lines = [disp(out.operand)]; }
     const jump = out.kind === "JUMP";
-    els.push(<rect key={k()} className={jump?"jumpbox":"boxrect"} x={bx} y={top} width={bw} height={BOX_H} rx="5" />);
+    els.push(<rect key={k()} className={(jump?"jumpbox":"boxrect") + (hot ? " liveborder" : "")} x={bx} y={top} width={bw} height={BOX_H} rx="5" />);
     els.push(<line key={k()} className={jump?"jumpbox":"boxrect"} x1={bx} y1={top+22} x2={bx+bw} y2={top+22} style={{fill:"none"}} />);
     els.push(<text key={k()} className="boxtitle" x={bx+bw/2} y={top+16} textAnchor="middle">{title}</text>);
     lines.filter(Boolean).forEach((ln, i) => {
       els.push(<text key={k()} className="boxtext" x={bx+bw/2} y={top+40+i*18} textAnchor="middle">{ln}</text>);
     });
+    if (simLine) els.push(<text key={k()} className="simval" x={bx+bw/2} y={top+BOX_H-6} textAnchor="middle">{simLine}</text>);
     drawIODetail(out.operand || out.dst || out.label, tr(out.comment), bx+bw/2, top+BOX_H+14);
   }
 
@@ -692,27 +902,28 @@ function Ladder({ networks, themeKey, zoom = 1, xlate }) {
       els.push(<line key={k()} x1={RAIL_L} y1={y+6} x2={RAIL_L} y2={y+h-6} style={{ stroke: nc, strokeWidth: 3 }} />);
       els.push(<line key={k()} x1={rightRailX} y1={y+6} x2={rightRailX} y2={y+h-6} style={{ stroke: nc, strokeWidth: 3 }} />);
 
-      // logic
+      // logic — power flows from the left rail (always hot) through the tree
       const xStart = RAIL_L + 12;
-      els.push(<line key={k()} className="wire" x1={RAIL_L} y1={cy} x2={xStart} y2={cy} />);
-      const xEnd = renderNode(rung.logic, xStart, cy);
+      els.push(<line key={k()} className={wcls(sim ? true : null)} x1={RAIL_L} y1={cy} x2={xStart} y2={cy} />);
+      const res = renderNode(rung.logic, xStart, cy, sim ? true : null);
+      const xEnd = res.x, rlo = sim ? res.out : null;
 
       // outputs — one or more coils/boxes that share this rung's VKE, stacked vertically
       const xOut = rightRailX - outW;
       if (outputs.length === 0) {
-        els.push(<line key={k()} className="wire" x1={xEnd} y1={cy} x2={rightRailX} y2={cy} />);
+        els.push(<line key={k()} className={wcls(rlo)} x1={xEnd} y1={cy} x2={rightRailX} y2={cy} />);
       } else {
         const N = outputs.length;
         const centers = outputs.map((_, i) => (cy - N * LANE_H / 2) + (i + 0.5) * LANE_H);
         const branchX = xOut - 22;
-        els.push(<line key={k()} className="wire" x1={xEnd} y1={cy} x2={branchX} y2={cy} />);
-        if (N > 1) els.push(<line key={k()} className="wire" x1={branchX} y1={centers[0]} x2={branchX} y2={centers[N-1]} />);
+        els.push(<line key={k()} className={wcls(rlo)} x1={xEnd} y1={cy} x2={branchX} y2={cy} />);
+        if (N > 1) els.push(<line key={k()} className={wcls(rlo)} x1={branchX} y1={centers[0]} x2={branchX} y2={centers[N-1]} />);
         outputs.forEach((o, i) => {
           const ocy = N > 1 ? centers[i] : cy;
           const ow = isBox(o) ? BOX_W : SYM;
-          els.push(<line key={k()} className="wire" x1={branchX} y1={ocy} x2={xOut} y2={ocy} />);
-          if (isBox(o)) drawBox(o, xOut, ocy); else drawCoil(o, xOut, ocy);
-          els.push(<line key={k()} className="wire" x1={xOut + ow} y1={ocy} x2={rightRailX} y2={ocy} />);
+          els.push(<line key={k()} className={wcls(rlo)} x1={branchX} y1={ocy} x2={xOut} y2={ocy} />);
+          if (isBox(o)) drawBox(o, xOut, ocy, rlo); else drawCoil(o, xOut, ocy, rlo);
+          els.push(<line key={k()} className={wcls(rlo)} x1={xOut + ow} y1={ocy} x2={rightRailX} y2={ocy} />);
         });
       }
       y += h;
@@ -1038,6 +1249,7 @@ const I = {
   fit:"M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5",
   shrink:"M9 9H4M9 9V4M9 9L4 4M15 9h5M15 9V4M15 9l5-5M9 15H4M9 15v5M9 15l-5 5M15 15h5M15 15v5M15 15l5 5",
   reset:"M3 12a9 9 0 109-9 9 9 0 00-6.4 2.6L3 8M3 3v5h5",
+  stop:"M6 6h12v12H6z",
   camera:"M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2zM12 17a4 4 0 100-8 4 4 0 000 8z",
   globe:"M12 2a10 10 0 100 20 10 10 0 000-20M2 12h20M12 2a15 15 0 010 20M12 2a15 15 0 000 20",
   x:"M18 6L6 18M6 6l12 12", check:"M20 6L9 17l-5-5", upload:"M12 3v12M8 7l4-4 4 4M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2",
@@ -1304,6 +1516,9 @@ function App() {
   const [trStatus, setTrStatus] = useState("");
   const [scanOpen, setScanOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [simOn, setSimOn] = useState(false);
+  const [, setSimTick] = useState(0);
+  const simMem = useRef(createSimMemory());
   const taRef = useRef(null), hlRef = useRef(null), gutterRef = useRef(null), scrollRef = useRef(null);
   const svgWrapRef = useRef(null);
 
@@ -1317,6 +1532,23 @@ function App() {
   const warnCount = allWarnings.length - errorCount;
   const rungCount = networks.reduce((s, n) => s + n.rungs.length, 0);
   const crossRef = useMemo(() => buildCrossRef(networks), [networks]);
+
+  // simulation scan loop: ~10 scans/second while running
+  useEffect(() => {
+    if (!simOn) return;
+    const id = setInterval(() => {
+      simScan(networks, simMem.current, Date.now());
+      setSimTick(t => t + 1);
+    }, 100);
+    return () => clearInterval(id);
+  }, [simOn, networks]);
+  const simReset = () => { simMem.current = createSimMemory(); setSimTick(t => t + 1); };
+  const simToggle = (n) => {
+    const key = simToggleKey(n);
+    if (!key) return;
+    simMem.current.bits[key] = !simMem.current.bits[key];
+    setSimTick(t => t + 1);
+  };
 
   // collect every unique comment used in the program
   const allComments = useMemo(() => {
@@ -1502,6 +1734,13 @@ function App() {
             <div className="flex-1" />
             {tab==="ladder" && (
               <div className="flex items-center gap-1 pr-2">
+                <button className="btn !px-2 !py-1" style={simOn ? { borderColor:"#2dff8f", color:"#2dff8f" } : { borderColor:"var(--green)", color:"var(--green)" }}
+                        title={simOn ? "Stop simulation" : "Run simulation — then click contacts to force inputs"}
+                        onClick={() => { if (!simOn) simReset(); setSimOn(v => !v); }}>
+                  <Ico d={simOn ? I.stop : I.play}/>{simOn ? "STOP" : "SIM"}
+                </button>
+                {simOn && <button className="btn !px-2 !py-1" title="Reset simulation memory (all bits, timers, counters)" onClick={simReset}><Ico d={I.reset}/></button>}
+                <span className="w-2" />
                 <button className="btn !px-2 !py-1" title="Zoom out" onClick={()=>setZoom(z=>Math.max(.4, +(z-.15).toFixed(2)))}><Ico d={I.zout}/></button>
                 <button className="btn !px-2 !py-1 !min-w-[52px]" title="Reset zoom (100%)" onClick={()=>setZoom(1)}>
                   <span className="mono text-xs">{Math.round(zoom*100)}%</span>
@@ -1519,7 +1758,8 @@ function App() {
               networks.length === 0
                 ? <Empty msg="No networks parsed. Load an example or type STL code." />
                 : <div className="anim-in" style={{ padding:"8px 12px", width:"max-content" }}>
-                    <Ladder networks={networks} themeKey={dark} zoom={zoom} xlate={translateOn ? translations : null} />
+                    <Ladder networks={networks} themeKey={dark} zoom={zoom} xlate={translateOn ? translations : null}
+                            sim={simOn ? { mem: simMem.current, onToggle: simToggle } : null} />
                   </div>
             )}
             {tab==="xref" && <CrossRefTable rows={crossRef} />}
@@ -1535,8 +1775,9 @@ function App() {
         <span style={{color: warnCount?"var(--amber)":"inherit"}}>⚠ <b>{warnCount}</b> warnings</span>
         <span style={{color: errorCount?"var(--coral)":"inherit"}}>✕ <b>{errorCount}</b> errors</span>
         <div className="flex-1" />
+        {simOn && <span style={{ color:"#2dff8f" }}>● SIM RUNNING — click contacts to force inputs</span>}
         <span>{parsed.blockType ? `${parsed.blockType} ${disp(parsed.blockName)}` : "no block header"}</span>
-        <span>Ready</span>
+        <span>{simOn ? "Simulating" : "Ready"}</span>
       </footer>
 
       {scanOpen && <ScanModal onClose={() => setScanOpen(false)} onInsert={(txt) => { setCode(txt); setDebounced(txt); setScanOpen(false); setTab("ladder"); }} />}

@@ -63,6 +63,15 @@
   .addr-m{fill:var(--purple);font-family:'JetBrains Mono';font-size:10px;font-weight:700}
   .iolab-i{fill:var(--accent);font-family:'JetBrains Mono';font-size:11px;font-weight:600}
   .iolab-q{fill:var(--green);font-family:'JetBrains Mono';font-size:11px;font-weight:600}
+
+  /* simulation: energized elements */
+  .live{stroke:#2dff8f !important;filter:drop-shadow(0 0 3px rgba(45,255,143,.75))}
+  .livefill{fill:#2dff8f;filter:drop-shadow(0 0 3px rgba(45,255,143,.75))}
+  .liveborder{stroke:#2dff8f !important;filter:drop-shadow(0 0 3px rgba(45,255,143,.55))}
+  .simval{fill:#2dff8f;font-family:'JetBrains Mono';font-size:11px;font-weight:700}
+  .light .live,.light .liveborder{stroke:#059646 !important;filter:none}
+  .light .livefill{fill:#059646;filter:none}
+  .light .simval{fill:#059646}
   .symtext{fill:var(--accent);font-weight:700;font-size:13px;font-family:'JetBrains Mono'}
   .coiltext{fill:var(--green);font-weight:700;font-size:13px;font-family:'JetBrains Mono'}
   .coiltext-sr{fill:var(--amber);font-weight:700;font-size:13px;font-family:'JetBrains Mono'}
