@@ -134,9 +134,12 @@ function tokenizeLine(raw) {
     }
     tokens.push(line.slice(i, j)); i = j;
   }
-  // merge "B [AR1,P#0.0]" style: a bracketed token attaches to the preceding operand
+  // merge "B [AR1,P#0.0]" style: a bracketed token attaches to a preceding SIZE-PREFIX
+  // operand (B/W/D/MW/DBW/...). It must NOT merge into a mnemonic — "A [AR1,P#0.0]"
+  // is the AND instruction with an area-crossing operand and stays separate.
+  const SIZE_PREFIX = /^(B|W|D|DW|DBB|DBW|DBD|DIB|DIW|DID|IB|IW|ID|QB|QW|QD|MB|MW|MD|LB|LW|LD)$/i;
   for (let x = tokens.length - 1; x > 0; x--) {
-    if (tokens[x].startsWith("[") && !"(),".includes(tokens[x - 1])) {
+    if (tokens[x].startsWith("[") && SIZE_PREFIX.test(tokens[x - 1])) {
       tokens[x - 1] += tokens[x]; tokens.splice(x, 1);
     }
   }
@@ -1341,6 +1344,136 @@ function HelpModal({ onClose }) {
 }
 
 /* ============================================================= *
+ *  POINTER SCHOOL — interactive lessons on STL pointers
+ * ============================================================= */
+// S7 area identifiers (top byte of an area-crossing pointer)
+const AREA_CODES = { P: 0x80, I: 0x81, Q: 0x82, M: 0x83, DBX: 0x84, DIX: 0x85, L: 0x86 };
+// parse "P#M10.0" / "P#10.0" / "P#DBX0.0" into { area, byte, bit }
+function parsePointerLiteral(txt) {
+  const m = String(txt || "").toUpperCase().replace(/\s/g, "").match(/^P#([A-Z]*)?(\d+)\.([0-7])$/);
+  if (!m) return null;
+  return { area: m[1] || "", byte: parseInt(m[2], 10), bit: parseInt(m[3], 10) };
+}
+function pointer32Bits(p) {
+  // bits 0-2 = bit no, bits 3-18 = byte address, bits 24-31 = area id (0 = area-internal)
+  const bit = p.bit & 7;
+  const byte = p.byte & 0xffff;
+  const areaByte = AREA_CODES[p.area] || 0;
+  const val = ((areaByte << 24) | (byte << 3) | bit) >>> 0;
+  return { val, bit, byte, areaByte };
+}
+const POINTER_LESSONS = [
+  {
+    title: "1 · Why pointers?",
+    body: "Normally you address a fixed operand: A I0.0. A pointer lets you compute the address at runtime, so one piece of code can walk through many operands — e.g. copy 100 data bytes, or index into an array with a variable. S7 stores pointers in the two 32-bit address registers AR1 and AR2, and as P# constants.",
+    code: "// Fixed address — always the same bit\n      A     I0.0\n      =     Q0.0",
+  },
+  {
+    title: "2 · The P# pointer constant",
+    body: "P# builds a pointer value. P#10.0 = byte 10, bit 0 (area-internal). P#M10.0 also carries the memory area (area-crossing). It's just a 32-bit number you load like any other — into an address register or a doubleword.",
+    code: "// Load pointer constants into ACCU 1\n      L     P#8.0        // byte 8, bit 0\n      L     P#M10.0      // area-crossing: flag M10.0\n      L     P#DBX0.0     // data bit DBX0.0",
+  },
+  {
+    title: "3 · Loading an address register",
+    body: "LAR1 loads AR1 with a pointer (from ACCU 1, or directly). Once AR1 holds a pointer you address indirectly with [AR1,P#0.0] — 'the operand AR1 points at, plus an offset of 0.0'. LAR2/AR2 work the same and are typically reserved for instance-DB access.",
+    code: "// Point AR1 at M byte 10, then read that bit\n      LAR1  P#M10.0\n      A     M[AR1,P#0.0]   // = A M10.0\n      =     Q0.0",
+  },
+  {
+    title: "4 · Register-indirect, area-internal",
+    body: "If AR1 holds only byte.bit (no area), the area comes from the operand you write. M[AR1,P#0.0] uses area M; Q[AR1,P#0.0] uses area Q — same AR1, different areas. The P# is an extra offset added to AR1.",
+    code: "      LAR1  P#0.0\n      A     I[AR1,P#0.0]   // input, offset 0\n      A     I[AR1,P#0.1]   // input, offset 0.1\n      =     Q[AR1,P#0.0]   // output, offset 0",
+  },
+  {
+    title: "5 · Area-crossing pointers",
+    body: "If AR1 holds an area-crossing pointer (loaded from P#M10.0, P#I0.0, …), then [AR1,P#0.0] carries its own area — one AR1 can reach I, Q, M or DB. You write the access with the size only (no area letter): B[AR1,P#0.0], W[AR1,P#0.0], D[AR1,P#0.0].",
+    code: "      LAR1  P#M10.0        // area-crossing: area = M\n      L     B[AR1,P#0.0]   // load byte MB10\n      T     MW100",
+  },
+  {
+    title: "6 · Stepping through data (+AR1)",
+    body: "+AR1 adds an offset to AR1 — this is how you walk an array. Add P#1.0 to advance one byte, P#2.0 for a word, P#4.0 for a doubleword. Combine with LOOP to process a whole block.",
+    code: "      LAR1  P#DBX0.0\n      L     10\n      T     MW100\nNEXT: L     DBB[AR1,P#0.0]\n      T     MB[AR1,P#0.0]\n      +AR1  P#1.0          // next byte\n      L     MW100\n      LOOP  NEXT",
+  },
+  {
+    title: "7 · Copy loop: DB10 → DB20",
+    body: "The classic block-copy: open the source and destination DBs, point AR1 and AR2 into each, then loop — read via AR1, write via AR2, advance both. This is exactly the routine you'd write to move a recipe or a data record.",
+    code: "      OPN   DB10\n      LAR1  P#DBX0.0\n      OPN   DB20\n      LAR2  P#DBX0.0\n      L     10\n      T     MW100\nLOOP1: L     B[AR1,P#0.0]\n       T     B[AR2,P#0.0]\n       +AR1  P#1.0\n       +AR2  P#1.0\n       L     MW100\n       LOOP  LOOP1",
+  },
+  {
+    title: "8 · Memory-indirect",
+    body: "Instead of an address register, the pointer can live in a doubleword. Load MD with a P# pointer, then address with [MD]. Simpler for a single indirection; AR1/AR2 win when you also need offset arithmetic.",
+    code: "      L     P#20.0\n      T     MD40           // store pointer in MD40\n      A     M[MD40]        // = A M20.0\n      =     Q0.0",
+  },
+];
+
+function PointerCalc() {
+  const [txt, setTxt] = useState("P#M10.0");
+  const p = parsePointerLiteral(txt);
+  const info = p ? pointer32Bits(p) : null;
+  const bits = info ? info.val >>> 0 : 0;
+  const grp = [];
+  for (let i = 31; i >= 0; i--) grp.push((bits >> i) & 1);
+  return (
+    <div className="rounded-xl p-3 mb-4" style={{ background: "var(--panel2)", border: "1px solid var(--border)" }}>
+      <div className="text-xs font-bold uppercase tracking-wider mb-2" style={{ color: "var(--accent)" }}>P# pointer calculator</div>
+      <input value={txt} onChange={e => setTxt(e.target.value)} spellCheck={false} className="mono w-full mb-2"
+        style={{ padding: "8px 11px", borderRadius: 8, border: "1px solid var(--border)", background: "var(--editorbg)", color: "var(--text)", fontSize: 13, outline: "none", boxSizing: "border-box" }} />
+      {!p ? <div className="text-xs" style={{ color: "var(--amber)" }}>Type a pointer like P#10.0, P#M10.0, P#DBX0.0</div> : (
+        <div>
+          <div className="flex flex-wrap gap-y-1 mb-2" style={{ fontFamily: "monospace", fontSize: 11 }}>
+            {grp.map((b, i) => {
+              const idx = 31 - i;
+              let col = "var(--muted)";
+              if (idx <= 2) col = "var(--green)";          // bit
+              else if (idx >= 3 && idx <= 18) col = "var(--accent)"; // byte address
+              else if (idx >= 24 && idx <= 31) col = "var(--amber)"; // area id
+              return <span key={i} style={{ color: col, width: 15, textAlign: "center", fontWeight: b ? 700 : 400, opacity: b ? 1 : .5 }}>{b}</span>;
+            })}
+          </div>
+          <div className="grid grid-cols-3 gap-2 text-xs">
+            <div><span style={{ color: "var(--amber)" }}>■</span> area <b className="mono">{p.area || "internal"}</b> (0x{info.areaByte.toString(16).toUpperCase().padStart(2, "0")})</div>
+            <div><span style={{ color: "var(--accent)" }}>■</span> byte <b className="mono">{p.byte}</b></div>
+            <div><span style={{ color: "var(--green)" }}>■</span> bit <b className="mono">{p.bit}</b></div>
+          </div>
+          <div className="text-xs mt-2" style={{ color: "var(--muted)" }}>
+            32-bit value: <span className="mono" style={{ color: "var(--text)" }}>DW#16#{(info.val >>> 0).toString(16).toUpperCase().padStart(8, "0")}</span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PointerSchool({ onLoad }) {
+  const [i, setI] = useState(0);
+  const L = POINTER_LESSONS[i];
+  return (
+    <div className="p-4 anim-in" style={{ maxWidth: 720 }}>
+      <div className="flex items-center gap-2 mb-3 flex-wrap">
+        {POINTER_LESSONS.map((_, n) => (
+          <button key={n} onClick={() => setI(n)} className="mono"
+            style={{ width: 26, height: 26, borderRadius: 7, fontSize: 12, fontWeight: 700, cursor: "pointer",
+              border: "1px solid " + (n === i ? "var(--accent)" : "var(--border)"),
+              background: n === i ? "var(--accent)" : "var(--panel2)", color: n === i ? "#04121a" : "var(--muted)" }}>{n + 1}</button>
+        ))}
+      </div>
+      <PointerCalc />
+      <h3 style={{ fontSize: 16, fontWeight: 700, marginBottom: 6 }}>{L.title}</h3>
+      <p style={{ fontSize: 13.5, lineHeight: 1.55, color: "var(--muted)", marginBottom: 12 }}>{L.body}</p>
+      <pre className="mono" style={{ background: "var(--editorbg)", border: "1px solid var(--border)", borderRadius: 10, padding: 14, fontSize: 12.5, lineHeight: "20px", overflow: "auto", whiteSpace: "pre" }}>{L.code}</pre>
+      <div className="flex items-center gap-2 mt-3">
+        <button className="btn btn-primary" onClick={() => onLoad(L.code)}><Ico d={I.play} />Load into editor &amp; convert</button>
+        <div className="flex-1" />
+        <button className="btn" disabled={i === 0} onClick={() => setI(x => Math.max(0, x - 1))} style={i === 0 ? { opacity: .5 } : {}}>← Prev</button>
+        <button className="btn" disabled={i === POINTER_LESSONS.length - 1} onClick={() => setI(x => Math.min(POINTER_LESSONS.length - 1, x + 1))} style={i === POINTER_LESSONS.length - 1 ? { opacity: .5 } : {}}>Next →</button>
+      </div>
+      <p className="text-xs mt-4" style={{ color: "var(--muted)" }}>
+        Tip: pointer/register ops (LAR1, +AR1, LOOP, OPN) have no ladder symbol — they're shown as annotations. Use the <b>SIM</b> button to run the bit-logic lessons, and the calculator above to see any P# broken into area / byte / bit.
+      </p>
+    </div>
+  );
+}
+
+/* ============================================================= *
  *  AUTH GATE  (client-side password — deterrent, not server auth)
  *  Change the password locally with:  npm run set-password -- "yourPassword"
  * ============================================================= */
@@ -1620,6 +1753,7 @@ function App() {
             <div className={"tab "+(tab==="errors"?"active":"")} onClick={()=>setTab("errors")}>
               Messages {allWarnings.length>0 && <span style={{color:errorCount?"var(--coral)":"var(--amber)"}}>({allWarnings.length})</span>}
             </div>
+            <div className={"tab "+(tab==="learn"?"active":"")} onClick={()=>setTab("learn")}>Learn Pointers</div>
             <div className="flex-1" />
             {tab==="ladder" && (
               <div className="flex items-center gap-1 pr-2">
@@ -1653,6 +1787,7 @@ function App() {
             )}
             {tab==="xref" && <CrossRefTable rows={crossRef} />}
             {tab==="errors" && <Messages items={allWarnings} onJump={()=>setTab("ladder")} />}
+            {tab==="learn" && <PointerSchool onLoad={(c) => { setCode(c); setDebounced(c); setTab("ladder"); }} />}
           </div>
         </section>
       </div>
