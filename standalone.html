@@ -39,15 +39,15 @@
   /* editor overlay technique */
   .editor-wrap{position:relative;flex:1;overflow:hidden;background:var(--editorbg)}
   .editor-scroll{position:absolute;inset:0;overflow:auto}
-  .editor-inner{position:relative;min-height:100%;display:flex}
-  .gutter{flex:0 0 auto;padding:14px 10px 14px 0;text-align:right;color:var(--muted);
-    background:var(--gutter);user-select:none;font-size:13px;line-height:21px;min-width:48px}
-  .code-area{position:relative;flex:1}
-  .hl,.ta{margin:0;padding:14px 16px;font-family:'JetBrains Mono',monospace;font-size:13px;
+  .editor-inner{position:relative;height:100%;display:flex}
+  .gutter{flex:0 0 auto;padding:14px 10px 40px 0;text-align:right;color:var(--muted);
+    background:var(--gutter);user-select:none;font-size:13px;line-height:21px;min-width:48px;overflow:hidden}
+  .code-area{position:relative;flex:1;overflow:hidden}
+  .hl,.ta{margin:0;padding:14px 16px 40px;font-family:'JetBrains Mono',monospace;font-size:13px;
     line-height:21px;white-space:pre;tab-size:4;letter-spacing:0}
-  .hl{position:absolute;inset:0;pointer-events:none;color:var(--text)}
+  .hl{position:absolute;inset:0;pointer-events:none;color:var(--text);overflow:hidden}
   .ta{position:relative;width:100%;height:100%;background:transparent;border:0;outline:0;
-    resize:none;color:transparent;caret-color:var(--accent);overflow:hidden}
+    resize:none;color:transparent;caret-color:var(--accent);overflow:auto}
   .ta::selection{background:rgba(0,212,255,.25)}
 
   .t-block{color:var(--purple);font-weight:700}
@@ -1469,7 +1469,8 @@ function App() {
           </div>
           <div className="editor-wrap mono">
             <div className="editor-inner">
-              <div className="gutter mono" ref={gutterRef} style={{overflow:"hidden"}}>
+              <div className="gutter mono" ref={gutterRef}
+                   onWheel={(e) => { if (taRef.current) { taRef.current.scrollTop += e.deltaY; taRef.current.scrollLeft += e.deltaX; } }}>
                 {Array.from({length: lineCount}, (_,i) => {
                   const nn = lineNet[i] || 0;
                   const col = nn > 0 ? netColor(nn) : "transparent";

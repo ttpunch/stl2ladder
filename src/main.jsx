@@ -1367,7 +1367,8 @@ function App() {
           </div>
           <div className="editor-wrap mono">
             <div className="editor-inner">
-              <div className="gutter mono" ref={gutterRef} style={{overflow:"hidden"}}>
+              <div className="gutter mono" ref={gutterRef}
+                   onWheel={(e) => { if (taRef.current) { taRef.current.scrollTop += e.deltaY; taRef.current.scrollLeft += e.deltaX; } }}>
                 {Array.from({length: lineCount}, (_,i) => {
                   const nn = lineNet[i] || 0;
                   const col = nn > 0 ? netColor(nn) : "transparent";
