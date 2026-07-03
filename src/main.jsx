@@ -1890,27 +1890,193 @@ function PointerSim({ editorCode }) {
   );
 }
 
+/* ============================================================= *
+ *  POINTER VISUAL GUIDE — pictures + thumb rules
+ * ============================================================= */
+// interactive: a pointer that visibly walks a memory strip in byte.bit steps
+function PtrWalk() {
+  const BASE = 10, NB = 6, cellW = 92, x0 = 14;
+  const W = x0 * 2 + NB * cellW, y0 = 66;
+  const [off, setOff] = useState(0); // offset in bits from MB10.0
+  const maxOff = NB * 8 - 1;
+  const byte = BASE + (off >> 3), bit = off & 7;
+  const ax = x0 + (off >> 3) * cellW + (bit + 0.5) * ((cellW - 4) / 8);
+  const bx = Math.min(Math.max(ax - 52, 4), W - 108);
+  return (
+    <div className="rounded-xl p-3 mb-4" style={{ background: "var(--panel2)", border: "1px solid var(--border)" }}>
+      <div className="text-xs font-bold uppercase tracking-wider mb-1" style={{ color: "var(--accent)" }}>1 · A pointer is an arrow into memory — watch it walk</div>
+      <p className="text-[11.5px] mb-1" style={{ color: "var(--muted)", lineHeight: 1.5 }}>
+        Pointers count in <b>byte.bit</b>. Press the buttons: <span className="mono">+P#0.1</span> moves ONE bit tick — after bit 7 it carries into the next byte. <span className="mono">+P#1.0</span> jumps a whole byte.
+      </p>
+      <svg viewBox={`0 0 ${W} 146`} style={{ width: "100%", display: "block" }}>
+        <rect x={bx} y={6} width={104} height={24} rx={6} fill="var(--boxfill)" stroke="var(--amber)" strokeWidth="2" />
+        <text x={bx + 52} y={22} textAnchor="middle" style={{ fill: "var(--amber)", fontFamily: "monospace", fontSize: 11.5, fontWeight: 700 }}>{`AR1 P#M${byte}.${bit}`}</text>
+        <line x1={ax} y1={30} x2={ax} y2={y0 - 7} stroke="var(--amber)" strokeWidth="2.5" />
+        <path d={`M ${ax - 5} ${y0 - 13} L ${ax} ${y0 - 4} L ${ax + 5} ${y0 - 13}`} fill="none" stroke="var(--amber)" strokeWidth="2.5" />
+        {Array.from({ length: NB }, (_, i2) => (
+          <g key={i2}>
+            <rect x={x0 + i2 * cellW} y={y0} width={cellW - 4} height={44} rx={7} fill="var(--editorbg)" stroke={(off >> 3) === i2 ? "var(--amber)" : "var(--border)"} strokeWidth="2" />
+            <text x={x0 + i2 * cellW + (cellW - 4) / 2} y={y0 + 17} textAnchor="middle" style={{ fill: "var(--text)", fontFamily: "monospace", fontSize: 12, fontWeight: 700 }}>{"MB" + (BASE + i2)}</text>
+            {Array.from({ length: 8 }, (_, b) => (
+              <rect key={b} x={x0 + i2 * cellW + b * ((cellW - 4) / 8) + 2} y={y0 + 26} width={(cellW - 4) / 8 - 4} height={11} rx={2}
+                fill={(off >> 3) === i2 && bit === b ? "var(--amber)" : "var(--border)"} opacity={(off >> 3) === i2 && bit === b ? 1 : .45} />
+            ))}
+            <text x={x0 + i2 * cellW + (cellW - 4) / 2} y={y0 + 60} textAnchor="middle" style={{ fill: "var(--muted)", fontFamily: "monospace", fontSize: 9.5 }}>{"bits 0–7 →"}</text>
+          </g>
+        ))}
+      </svg>
+      <div className="flex gap-2 flex-wrap items-center mt-1">
+        <button className="btn !py-1 mono" onClick={() => setOff(o => Math.min(maxOff, o + 1))}>+AR1 P#0.1</button>
+        <button className="btn !py-1 mono" onClick={() => setOff(o => Math.min(maxOff, o + 8))}>+AR1 P#1.0</button>
+        <button className="btn !py-1 mono" onClick={() => setOff(o => Math.min(maxOff, o + 16))}>+AR1 P#2.0</button>
+        <button className="btn !py-1" onClick={() => setOff(0)}><Ico d={I.reset} />Reset</button>
+        <span className="text-xs mono" style={{ color: "var(--amber)" }}>{`AR1 = P#M${byte}.${bit}`}</span>
+      </div>
+    </div>
+  );
+}
+
+// static: labeled anatomy of the 32-bit pointer value
+function PtrAnatomy() {
+  const segs = [
+    { bits: 8, label: "AREA", val: "1000 0011", note: "83h = M", color: "var(--amber)" },
+    { bits: 5, label: "—", val: "0 0000", note: "unused", color: "var(--muted)" },
+    { bits: 16, label: "BYTE ADDRESS", val: "0000 0000 0000 1100", note: "= byte 12", color: "var(--accent)" },
+    { bits: 3, label: "BIT", val: "100", note: "= bit 4", color: "var(--green)" },
+  ];
+  const W = 640, x0 = 8, unit = (W - 16) / 32;
+  let cx = x0;
+  const rects = segs.map(s => { const r = { ...s, x: cx, w: s.bits * unit }; cx += s.bits * unit; return r; });
+  return (
+    <div className="rounded-xl p-3 mb-4" style={{ background: "var(--panel2)", border: "1px solid var(--border)" }}>
+      <div className="text-xs font-bold uppercase tracking-wider mb-1" style={{ color: "var(--accent)" }}>2 · Anatomy of the 32-bit pointer — example P#M12.4</div>
+      <svg viewBox={`0 0 ${W} 112`} style={{ width: "100%", display: "block" }}>
+        {rects.map((r, i2) => (
+          <g key={i2}>
+            <text x={r.x + (r.w - 3) / 2} y={12} textAnchor="middle" style={{ fill: r.color, fontSize: 10.5, fontWeight: 700, fontFamily: "Inter" }}>{r.label}</text>
+            <rect x={r.x} y={18} width={r.w - 3} height={32} rx={6} fill="var(--editorbg)" stroke={r.color} strokeWidth="2" />
+            <text x={r.x + (r.w - 3) / 2} y={38} textAnchor="middle" style={{ fill: "var(--text)", fontSize: r.bits > 6 ? 10 : 9, fontFamily: "monospace" }}>{r.val}</text>
+            <text x={r.x + (r.w - 3) / 2} y={64} textAnchor="middle" style={{ fill: "var(--muted)", fontSize: 10, fontFamily: "monospace" }}>{r.note}</text>
+          </g>
+        ))}
+        <text x={x0} y={90} style={{ fill: "var(--muted)", fontSize: 11, fontFamily: "monospace" }}>= DW#16#8300&#8201;0064 — the CPU counts in BITS: 12 × 8 + 4 = 100 = 64h</text>
+        <text x={x0} y={106} style={{ fill: "var(--muted)", fontSize: 11, fontFamily: "monospace" }}>Area byte: 81=I · 82=Q · 83=M · 84=DBX (open DB) · 85=DIX (open DI) · 00=area-internal</text>
+      </svg>
+    </div>
+  );
+}
+
+// static: WHERE does the area come from — the confusion killer
+function PtrAreaRouting() {
+  const Box = ({ x, y, w, h, stroke, children, fs = 11, fill = "var(--editorbg)" }) => (
+    <g>
+      <rect x={x} y={y} width={w} height={h} rx={6} fill={fill} stroke={stroke} strokeWidth="2" />
+      <text x={x + w / 2} y={y + h / 2 + 4} textAnchor="middle" style={{ fill: stroke, fontFamily: "monospace", fontSize: fs, fontWeight: 700 }}>{children}</text>
+    </g>
+  );
+  const Arrow = ({ d, color, label, lx, ly }) => (
+    <g>
+      <path d={d} fill="none" stroke={color} strokeWidth="2" markerEnd="none" />
+      {label && <text x={lx} y={ly} textAnchor="middle" style={{ fill: color, fontSize: 9.5, fontFamily: "Inter", fontWeight: 600 }}>{label}</text>}
+    </g>
+  );
+  return (
+    <div className="rounded-xl p-3 mb-4" style={{ background: "var(--panel2)", border: "1px solid var(--border)" }}>
+      <div className="text-xs font-bold uppercase tracking-wider mb-1" style={{ color: "var(--accent)" }}>3 · Who supplies the AREA? (the #1 confusion)</div>
+      <div className="flex gap-3 flex-wrap">
+        <svg viewBox="0 0 320 150" style={{ flex: 1, minWidth: 280, display: "block" }}>
+          <text x={160} y={14} textAnchor="middle" style={{ fill: "var(--text)", fontSize: 11.5, fontWeight: 700, fontFamily: "Inter" }}>Area-internal — operand names the area</text>
+          <text x={160} y={32} textAnchor="middle" style={{ fill: "var(--operand)", fontSize: 12, fontFamily: "monospace", fontWeight: 700 }}>A  M[AR1,P#2.0]</text>
+          <Box x={20} y={52} w={70} h={26} stroke="var(--green)">M ←area</Box>
+          <Box x={20} y={96} w={110} h={26} stroke="var(--amber)" fs={10.5}>AR1 = P#10.0</Box>
+          <Arrow d="M 90 65 C 150 65 180 78 218 84" color="var(--green)" label="area M" lx={150} ly={60} />
+          <Arrow d="M 130 109 C 170 109 190 96 218 90" color="var(--amber)" label="byte.bit 10.0 + 2.0" lx={168} ly={126} />
+          <Box x={220} y={74} w={80} h={26} stroke="var(--accent)" fs={12}>M12.0</Box>
+        </svg>
+        <svg viewBox="0 0 320 150" style={{ flex: 1, minWidth: 280, display: "block" }}>
+          <text x={160} y={14} textAnchor="middle" style={{ fill: "var(--text)", fontSize: 11.5, fontWeight: 700, fontFamily: "Inter" }}>Area-crossing — the register carries BOTH</text>
+          <text x={160} y={32} textAnchor="middle" style={{ fill: "var(--operand)", fontSize: 12, fontFamily: "monospace", fontWeight: 700 }}>A  [AR1,P#2.0]   ← no area letter!</text>
+          <rect x={40} y={82} width={40} height={26} rx={6} fill="var(--editorbg)" stroke="var(--green)" strokeWidth="2" />
+          <text x={60} y={99} textAnchor="middle" style={{ fill: "var(--green)", fontFamily: "monospace", fontSize: 11, fontWeight: 700 }}>M</text>
+          <rect x={80} y={82} width={70} height={26} rx={6} fill="var(--editorbg)" stroke="var(--amber)" strokeWidth="2" />
+          <text x={115} y={99} textAnchor="middle" style={{ fill: "var(--amber)", fontFamily: "monospace", fontSize: 11, fontWeight: 700 }}>10.0</text>
+          <text x={95} y={72} textAnchor="middle" style={{ fill: "var(--muted)", fontSize: 9.5, fontFamily: "Inter" }}>AR1 loaded with P#M10.0</text>
+          <Arrow d="M 150 95 C 185 95 195 95 218 95" color="var(--accent)" label="+ 2.0" lx={185} ly={88} />
+          <Box x={220} y={82} w={80} h={26} stroke="var(--accent)" fs={12}>M12.0</Box>
+          <text x={160} y={138} textAnchor="middle" style={{ fill: "var(--muted)", fontSize: 10, fontFamily: "Inter" }}>Access written with size only: B / W / D [AR1,P#..]</text>
+        </svg>
+      </div>
+    </div>
+  );
+}
+
+const THUMB_RULES = [
+  { icon: "🔢", rule: "A pointer is just a number", why: "P#10.0 is a 32-bit constant. Load it, park it in an MD, do math on it — it only 'points' when used inside [ ].", code: "L P#10.0 → 16#00000050" },
+  { icon: "👣", rule: "Everything counts in byte.bit", why: "P#0.1 = one bit · P#1.0 = one byte · P#2.0 = a word · P#4.0 = a dword. Bits carry into bytes at 8.", code: "+AR1 P#2.0  // next INT" },
+  { icon: "🧭", rule: "Area letter on the operand ⇒ area-internal", why: "M[AR1,..] takes area M from the operand. B[AR1,..] or [AR1,..] have no letter — the area must already be inside AR1 (P#M.., P#DBX..).", code: "A M[AR1,P#0.0]" },
+  { icon: "📂", rule: "DBX always means the CURRENTLY open DB", why: "OPN another DB and every DBX pointer silently re-aims. For a second DB use OPN DI + P#DIX.", code: "OPN DI20 · LAR2 P#DIX0.0" },
+  { icon: "🛑", rule: "Hands off AR2 inside FBs", why: "The system uses AR2 for multi-instance addressing. Save/restore it (TAR2 … LAR2) or just use AR1.", code: "TAR2 MD90 … LAR2 MD90" },
+  { icon: "➕", rule: "[AR1,P#2.0] adds — +AR1 moves", why: "The offset in brackets never changes AR1; it's added on the fly. Only +AR1 actually advances the register.", code: "" },
+  { icon: "🔁", rule: "Store the LOOP counter at the label", why: "LOOP decrements ACCU1 and jumps. Write it back (T MWx) at the jump target — or you loop forever.", code: "NEXT: T MW100" },
+  { icon: "🧮", rule: "L / T never touch the RLO", why: "Pointer setup can sit in the middle of bit logic without corrupting the rung result.", code: "" },
+];
+
+function PointerVisual() {
+  return (
+    <div className="anim-in">
+      <PtrWalk />
+      <PtrAnatomy />
+      <PtrAreaRouting />
+      <div className="text-xs font-bold uppercase tracking-wider mb-2" style={{ color: "var(--accent)" }}>4 · Thumb rules — pin these to the wall</div>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+        {THUMB_RULES.map((r, i2) => (
+          <div key={i2} className="rounded-xl p-3" style={{ background: "var(--panel2)", border: "1px solid var(--border)" }}>
+            <div className="flex items-center gap-2 mb-1">
+              <span style={{ fontSize: 16 }}>{r.icon}</span>
+              <span style={{ fontWeight: 700, fontSize: 13 }}>{r.rule}</span>
+            </div>
+            <div className="text-xs" style={{ color: "var(--muted)", lineHeight: 1.5 }}>{r.why}</div>
+            {r.code && <div className="mono text-[11px] mt-1.5" style={{ color: "var(--operand)" }}>{r.code}</div>}
+          </div>
+        ))}
+      </div>
+      <p className="text-xs mt-3" style={{ color: "var(--muted)" }}>
+        Then prove each rule to yourself in the <b>▶ Pointer Simulator</b> — step the copy-loop demo and watch rules 2, 4 and 7 happen live.
+      </p>
+    </div>
+  );
+}
+
 function PointerSchool({ onLoad, editorCode }) {
   const [mode, setMode] = useState("lessons");
   const [i, setI] = useState(0);
   const L = POINTER_LESSONS[i];
+  const modeBar = (
+    <div className="flex items-center gap-2 mb-3 flex-wrap">
+      {[["lessons", "📖 Lessons"], ["visual", "🖼 Visual Guide"], ["sim", "▶ Pointer Simulator"]].map(([m, lab]) => (
+        <button key={m} className={"btn " + (mode === m ? "!border-[var(--accent)] !text-[var(--accent)]" : "")} onClick={() => setMode(m)}>{lab}</button>
+      ))}
+    </div>
+  );
   if (mode === "sim") {
     return (
       <div className="p-4 anim-in" style={{ maxWidth: 860 }}>
-        <div className="flex items-center gap-2 mb-3">
-          <button className="btn" onClick={() => setMode("lessons")}>📖 Lessons</button>
-          <button className="btn !border-[var(--accent)] !text-[var(--accent)]">▶ Pointer Simulator</button>
-        </div>
+        {modeBar}
         <PointerSim editorCode={editorCode} />
+      </div>
+    );
+  }
+  if (mode === "visual") {
+    return (
+      <div className="p-4 anim-in" style={{ maxWidth: 860 }}>
+        {modeBar}
+        <PointerVisual />
       </div>
     );
   }
   return (
     <div className="p-4 anim-in" style={{ maxWidth: 720 }}>
-      <div className="flex items-center gap-2 mb-3">
-        <button className="btn !border-[var(--accent)] !text-[var(--accent)]">📖 Lessons</button>
-        <button className="btn" onClick={() => setMode("sim")}>▶ Pointer Simulator</button>
-      </div>
+      {modeBar}
       <div className="flex items-center gap-2 mb-3 flex-wrap">
         {POINTER_LESSONS.map((_, n) => (
           <button key={n} onClick={() => setI(n)} className="mono"
