@@ -1362,46 +1362,101 @@ function pointer32Bits(p) {
   const val = ((areaByte << 24) | (byte << 3) | bit) >>> 0;
   return { val, bit, byte, areaByte };
 }
+// One coherent course: story → picture → worked example (line by line) → thumb rule.
 const POINTER_LESSONS = [
   {
-    title: "1 · Why pointers?",
-    body: "Normally you address a fixed operand: A I0.0. A pointer lets you compute the address at runtime, so one piece of code can walk through many operands — e.g. copy 100 data bytes, or index into an array with a variable. S7 stores pointers in the two 32-bit address registers AR1 and AR2, and as P# constants.",
-    code: "// Fixed address — always the same bit\n      A     I0.0\n      =     Q0.0",
+    title: "1 · What is a pointer, really?",
+    story: "A M10.0 hard-wires the address into the program — like a postman who always walks to house №10. A pointer writes the address on a slip of paper instead: the instruction first reads the slip, then goes wherever it says. Same instruction, different target — you only rewrite the slip.\n\nIn S7 the slips are 32-bit numbers. You keep them in the two address registers AR1 / AR2 (or park them in a doubleword like MD40), and you follow them with square brackets [ ].",
+    code: [
+      ["      L     P#10.0", "Write a slip that says “byte 10, bit 0”. Right now it is just a number sitting in ACCU1."],
+      ["      LAR1", "Hand the slip to address register AR1."],
+      ["      A     M[AR1,P#0.0]", "Follow the slip: area M (from the operand letter) + byte 10.0 (from AR1) → this reads M10.0."],
+      ["      =     Q0.0", "An ordinary output — the pointer only lived in the input contact."],
+    ],
+    rules: [{ icon: "🔢", text: "A pointer is just a number — an address on a slip of paper, not the value itself.", why: "L P#10.0 loads 16#00000050 into ACCU1. Nothing “points” until it is used inside [ ]." }],
   },
   {
-    title: "2 · The P# pointer constant",
-    body: "P# builds a pointer value. P#10.0 = byte 10, bit 0 (area-internal). P#M10.0 also carries the memory area (area-crossing). It's just a 32-bit number you load like any other — into an address register or a doubleword.",
-    code: "// Load pointer constants into ACCU 1\n      L     P#8.0        // byte 8, bit 0\n      L     P#M10.0      // area-crossing: flag M10.0\n      L     P#DBX0.0     // data bit DBX0.0",
+    title: "2 · How an address is written: P# and byte.bit",
+    story: "PLC memory is one long row of bytes, and every byte holds 8 bits. So an address is two numbers — WHICH BYTE and WHICH BIT — written as byte.bit. P#50.3 means byte 50, bit 3.\n\nInside the 32-bit slip the CPU also stores WHICH AREA (I, Q, M, DB …) in the top byte. Study the picture, then type any P# into the calculator to see it split apart.",
+    visual: "anatomyCalc",
+    rules: [{ icon: "👣", text: "Everything counts in byte.bit — P#1.0 is one byte (8 bits), P#0.1 is a single bit.", why: "That is why stepping a WORD array needs +AR1 P#2.0, and a DINT/REAL array +AR1 P#4.0." }],
   },
   {
-    title: "3 · Loading an address register",
-    body: "LAR1 loads AR1 with a pointer (from ACCU 1, or directly). Once AR1 holds a pointer you address indirectly with [AR1,P#0.0] — 'the operand AR1 points at, plus an offset of 0.0'. LAR2/AR2 work the same and are typically reserved for instance-DB access.",
-    code: "// Point AR1 at M byte 10, then read that bit\n      LAR1  P#M10.0\n      A     M[AR1,P#0.0]   // = A M10.0\n      =     Q0.0",
+    title: "3 · The hands that hold the slip: AR1 and AR2",
+    story: "The CPU has two “hands” built for holding address slips: AR1 and AR2. LAR1 puts a slip into hand 1 (from ACCU1, or directly). TAR1 copies it back out. CAR swaps the two hands.",
+    code: [
+      ["      L     P#0.0", "A slip: byte 0, bit 0 — no area yet."],
+      ["      LAR1", "AR1 takes the slip from ACCU1."],
+      ["      LAR2  P#100.0", "AR2 can also be loaded directly, without going through ACCU1."],
+      ["      TAR1  MD24", "Copy AR1's slip into MD24 — saved for later."],
+      ["      CAR", "Swap the hands: AR1 ⇄ AR2."],
+    ],
+    rules: [{ icon: "🛑", text: "Inside FBs, AR2 belongs to the system.", why: "STEP 7 uses AR2 to address multi-instance data. Borrow it only with TAR2 … work … LAR2, or simply stick to AR1." }],
   },
   {
-    title: "4 · Register-indirect, area-internal",
-    body: "If AR1 holds only byte.bit (no area), the area comes from the operand you write. M[AR1,P#0.0] uses area M; Q[AR1,P#0.0] uses area Q — same AR1, different areas. The P# is an extra offset added to AR1.",
-    code: "      LAR1  P#0.0\n      A     I[AR1,P#0.0]   // input, offset 0\n      A     I[AR1,P#0.1]   // input, offset 0.1\n      =     Q[AR1,P#0.0]   // output, offset 0",
+    title: "4 · Following the arrow: [AR1, P#offset]",
+    story: "Square brackets mean “follow the slip”. The P# inside the brackets is an extra offset added ON THE FLY — the register itself does not move. So [AR1,P#2.3] means “2 bytes and 3 bits past where AR1 points”, and afterwards AR1 still points exactly where it did before.",
+    code: [
+      ["      LAR1  P#10.0", "AR1 → byte 10."],
+      ["      A     M[AR1,P#0.0]", "Reads M10.0 (10.0 + 0.0)."],
+      ["      A     M[AR1,P#2.3]", "Reads M12.3 (10.0 + 2.3) — and AR1 is STILL 10.0!"],
+      ["      =     Q0.0", "The AND of both bits drives the output."],
+    ],
+    rules: [{ icon: "➕", text: "[AR1,P#2.0] adds temporarily — only +AR1 truly moves the register.", why: "Use the bracket offset to reach fields of a fixed structure; use +AR1 to walk." }],
   },
   {
-    title: "5 · Area-crossing pointers",
-    body: "If AR1 holds an area-crossing pointer (loaded from P#M10.0, P#I0.0, …), then [AR1,P#0.0] carries its own area — one AR1 can reach I, Q, M or DB. You write the access with the size only (no area letter): B[AR1,P#0.0], W[AR1,P#0.0], D[AR1,P#0.0].",
-    code: "      LAR1  P#M10.0        // area-crossing: area = M\n      L     B[AR1,P#0.0]   // load byte MB10\n      T     MW100",
+    title: "5 · Who supplies the AREA? The two flavours",
+    story: "An address needs a memory area (I, Q, M, DB …), and it can come from either side. This is the №1 source of pointer confusion — the picture below shows both routes.\n\nAREA-INTERNAL: the slip holds only byte.bit, and the OPERAND names the area — M[AR1,..], I[AR1,..], Q[AR1,..]. One slip, reusable across neighbourhoods.\n\nAREA-CROSSING: the slip carries the area itself (loaded from P#M10.0, P#DBX0.0, …). The access is then written with the SIZE only — B[AR1,..], W[AR1,..], D[AR1,..] — or bare [AR1,..] for a bit.",
+    visual: "routing",
+    code: [
+      ["      LAR1  P#10.0", "Internal slip: just 10.0, no area."],
+      ["      A     I[AR1,P#0.0]", "The operand letter I supplies the area → reads I10.0."],
+      ["      LAR1  P#M10.0", "Crossing slip: area M now travels inside the register."],
+      ["      L     B[AR1,P#0.0]", "No area letter — only the size B → loads MB10."],
+    ],
+    rules: [{ icon: "🧭", text: "Letter on the operand ⇒ area-internal. No letter (B/W/D/[..]) ⇒ the area must already be in the register.", why: "Mixing the two flavours is the classic pointer bug — glance at the picture above whenever unsure." }],
   },
   {
-    title: "6 · Stepping through data (+AR1)",
-    body: "+AR1 adds an offset to AR1 — this is how you walk an array. Add P#1.0 to advance one byte, P#2.0 for a word, P#4.0 for a doubleword. LOOP decrements ACCU1 and jumps while it is non-zero — note the counter is stored back (T MW100) at the label, otherwise the loop never ends. Watch this exact pattern run in the ▶ Pointer Simulator.",
-    code: "      LAR1  P#M10.0        // AR1 → flag byte 10\n      L     5              // process 5 bytes\nNEXT: T     MW100          // store loop counter!\n      L     99\n      T     B[AR1,P#0.0]   // write via AR1\n      +AR1  P#1.0          // next byte\n      L     MW100          // reload counter\n      LOOP  NEXT           // ACCU1−1, jump while ≠ 0",
+    title: "6 · Walking through data: +AR1",
+    story: "Arrays are processed by moving the arrow forward: +AR1 adds to the register FOR REAL. +AR1 P#1.0 steps one byte; single bits carry into the next byte at 8. Press the buttons below and watch the arrow walk the memory strip.",
+    visual: "walk",
+    code: [
+      ["      L     99", "The value we will write everywhere."],
+      ["      LAR1  P#M10.0", "The arrow starts at flag byte 10."],
+      ["      T     B[AR1,P#0.0]", "Write 99 where the arrow points → MB10."],
+      ["      +AR1  P#1.0", "The arrow itself steps one byte → MB11."],
+      ["      T     B[AR1,P#0.0]", "Write again → MB11. Wrap this in LOOP for a whole block (next lesson)."],
+    ],
+    rules: [{ icon: "👣", text: "Match the step to the element: P#1.0 = BYTE · P#2.0 = WORD/INT · P#4.0 = DWORD/DINT/REAL.", why: "Stepping a word array by P#1.0 reads overlapping garbage." }],
   },
   {
-    title: "7 · Copy loop: DB10 → DB20",
-    body: "The classic block-copy — but note the trap: a DBX pointer always reads the CURRENTLY open DB, so two OPN DBs would clobber each other. The correct S7 pattern opens the destination as an instance DB (OPN DI) and points AR2 with P#DIX. Run this step by step in the ▶ Pointer Simulator to watch the bytes move.",
-    code: "      OPN   DB10           // DB register = source\n      OPN   DI20           // DI register = destination\n      LAR1  P#DBX0.0       // AR1 → DB10 byte 0\n      LAR2  P#DIX0.0       // AR2 → DB20 byte 0\n      L     5              // 5 bytes\nNEXT: T     MW100          // store loop counter\n      L     B[AR1,P#0.0]   // read source via AR1\n      T     B[AR2,P#0.0]   // write destination via AR2\n      +AR1  P#1.0\n      +AR2  P#1.0\n      L     MW100\n      LOOP  NEXT",
+    title: "7 · The real thing: copy DB10 → DB20 with LOOP",
+    story: "Everything together — the block copy every S7 programmer eventually writes. Two traps hide inside it:\n\n① A DBX slip points into whatever DB is CURRENTLY open — a second OPN DB would silently re-aim it. So the destination is opened as an instance DB instead: OPN DI + P#DIX.\n\n② LOOP decrements ACCU1 and jumps while it is not zero — the counter must be written back at the jump label (T MW100), otherwise the loop never ends.",
+    code: [
+      ["      OPN   DB10", "Open the SOURCE in the DB register."],
+      ["      OPN   DI20", "Open the DESTINATION in the DI register — trap ① avoided."],
+      ["      LAR1  P#DBX0.0", "AR1 → byte 0 of the open DB (= DB10)."],
+      ["      LAR2  P#DIX0.0", "AR2 → byte 0 of the open DI (= DB20)."],
+      ["      L     5", "Five bytes to copy."],
+      ["NEXT: T     MW100", "Store the loop counter — trap ② avoided."],
+      ["      L     B[AR1,P#0.0]", "Read the source byte AR1 points at."],
+      ["      T     B[AR2,P#0.0]", "Write it where AR2 points."],
+      ["      +AR1  P#1.0", "Source arrow steps one byte."],
+      ["      +AR2  P#1.0", "Destination arrow steps one byte."],
+      ["      L     MW100", "Reload the counter…"],
+      ["      LOOP  NEXT", "…ACCU1 − 1; jump to NEXT while ≠ 0."],
+    ],
+    rules: [
+      { icon: "📂", text: "DBX always means the CURRENTLY open DB.", why: "For a second DB use OPN DI + P#DIX — never two OPN DBs." },
+      { icon: "🔁", text: "Store the LOOP counter at the label.", why: "LOOP counts ACCU1, not your memory word — write it back or loop forever." },
+    ],
+    sim: true,
   },
   {
-    title: "8 · Memory-indirect",
-    body: "Instead of an address register, the pointer can live in a doubleword. Load MD with a P# pointer, then address with [MD]. Simpler for a single indirection; AR1/AR2 win when you also need offset arithmetic.",
-    code: "      L     P#20.0\n      T     MD40           // store pointer in MD40\n      A     M[MD40]        // = A M20.0\n      =     Q0.0",
+    title: "8 · Recap — pin these to the wall",
+    story: "That is the whole story: an address is a number (lessons 1–2), two registers hold it (3), brackets follow it (4), the area comes from the operand or from the register (5), +AR walks it (6), and LOOP repeats it (7). Here are all the thumb rules in one place:",
+    recap: true,
+    sim: true,
   },
 ];
 
@@ -2021,39 +2076,14 @@ const THUMB_RULES = [
   { icon: "🧮", rule: "L / T never touch the RLO", why: "Pointer setup can sit in the middle of bit logic without corrupting the rung result.", code: "" },
 ];
 
-function PointerVisual() {
-  return (
-    <div className="anim-in">
-      <PtrWalk />
-      <PtrAnatomy />
-      <PtrAreaRouting />
-      <div className="text-xs font-bold uppercase tracking-wider mb-2" style={{ color: "var(--accent)" }}>4 · Thumb rules — pin these to the wall</div>
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-        {THUMB_RULES.map((r, i2) => (
-          <div key={i2} className="rounded-xl p-3" style={{ background: "var(--panel2)", border: "1px solid var(--border)" }}>
-            <div className="flex items-center gap-2 mb-1">
-              <span style={{ fontSize: 16 }}>{r.icon}</span>
-              <span style={{ fontWeight: 700, fontSize: 13 }}>{r.rule}</span>
-            </div>
-            <div className="text-xs" style={{ color: "var(--muted)", lineHeight: 1.5 }}>{r.why}</div>
-            {r.code && <div className="mono text-[11px] mt-1.5" style={{ color: "var(--operand)" }}>{r.code}</div>}
-          </div>
-        ))}
-      </div>
-      <p className="text-xs mt-3" style={{ color: "var(--muted)" }}>
-        Then prove each rule to yourself in the <b>▶ Pointer Simulator</b> — step the copy-loop demo and watch rules 2, 4 and 7 happen live.
-      </p>
-    </div>
-  );
-}
-
 function PointerSchool({ onLoad, editorCode }) {
   const [mode, setMode] = useState("lessons");
   const [i, setI] = useState(0);
   const L = POINTER_LESSONS[i];
+  const last = POINTER_LESSONS.length - 1;
   const modeBar = (
     <div className="flex items-center gap-2 mb-3 flex-wrap">
-      {[["lessons", "📖 Lessons"], ["visual", "🖼 Visual Guide"], ["sim", "▶ Pointer Simulator"]].map(([m, lab]) => (
+      {[["lessons", "📖 Full Lesson"], ["sim", "▶ Pointer Simulator"]].map(([m, lab]) => (
         <button key={m} className={"btn " + (mode === m ? "!border-[var(--accent)] !text-[var(--accent)]" : "")} onClick={() => setMode(m)}>{lab}</button>
       ))}
     </div>
@@ -2066,38 +2096,79 @@ function PointerSchool({ onLoad, editorCode }) {
       </div>
     );
   }
-  if (mode === "visual") {
-    return (
-      <div className="p-4 anim-in" style={{ maxWidth: 860 }}>
-        {modeBar}
-        <PointerVisual />
-      </div>
-    );
-  }
   return (
-    <div className="p-4 anim-in" style={{ maxWidth: 720 }}>
+    <div className="p-4 anim-in" style={{ maxWidth: 780 }}>
       {modeBar}
-      <div className="flex items-center gap-2 mb-3 flex-wrap">
+      {/* course progress */}
+      <div className="flex items-center gap-2 mb-1 flex-wrap">
         {POINTER_LESSONS.map((_, n) => (
-          <button key={n} onClick={() => setI(n)} className="mono"
+          <button key={n} onClick={() => setI(n)} className="mono" title={POINTER_LESSONS[n].title}
             style={{ width: 26, height: 26, borderRadius: 7, fontSize: 12, fontWeight: 700, cursor: "pointer",
               border: "1px solid " + (n === i ? "var(--accent)" : "var(--border)"),
-              background: n === i ? "var(--accent)" : "var(--panel2)", color: n === i ? "#04121a" : "var(--muted)" }}>{n + 1}</button>
+              background: n === i ? "var(--accent)" : n < i ? "var(--panel2)" : "transparent",
+              color: n === i ? "#04121a" : n < i ? "var(--accent)" : "var(--muted)" }}>{n < i ? "✓" : n + 1}</button>
         ))}
+        <span className="text-[11px] ml-1" style={{ color: "var(--muted)" }}>Lesson {i + 1} of {POINTER_LESSONS.length}</span>
       </div>
-      <PointerCalc />
-      <h3 style={{ fontSize: 16, fontWeight: 700, marginBottom: 6 }}>{L.title}</h3>
-      <p style={{ fontSize: 13.5, lineHeight: 1.55, color: "var(--muted)", marginBottom: 12 }}>{L.body}</p>
-      <pre className="mono" style={{ background: "var(--editorbg)", border: "1px solid var(--border)", borderRadius: 10, padding: 14, fontSize: 12.5, lineHeight: "20px", overflow: "auto", whiteSpace: "pre" }}>{L.code}</pre>
-      <div className="flex items-center gap-2 mt-3">
-        <button className="btn btn-primary" onClick={() => onLoad(L.code)}><Ico d={I.play} />Load into editor &amp; convert</button>
+
+      <h3 style={{ fontSize: 17, fontWeight: 700, margin: "12px 0 8px" }}>{L.title}</h3>
+      {L.story.split("\n\n").map((p, pi) => (
+        <p key={pi} style={{ fontSize: 13.5, lineHeight: 1.62, color: "var(--muted)", marginBottom: 10 }}>{p}</p>
+      ))}
+
+      {/* embedded visuals where they belong */}
+      {L.visual === "anatomyCalc" && <><PtrAnatomy /><PointerCalc /></>}
+      {L.visual === "routing" && <PtrAreaRouting />}
+      {L.visual === "walk" && <PtrWalk />}
+
+      {/* worked example — every line explained */}
+      {L.code && (
+        <div className="rounded-xl overflow-hidden mb-3" style={{ border: "1px solid var(--border)" }}>
+          <div className="px-3 py-1.5 text-[11px] font-bold uppercase tracking-wider" style={{ background: "var(--panel2)", color: "var(--accent)" }}>Worked example — read it line by line</div>
+          {L.code.map(([src, ex], ri) => (
+            <div key={ri} className="flex flex-col sm:flex-row" style={{ borderTop: "1px solid var(--border)", background: "var(--editorbg)" }}>
+              <pre className="mono" style={{ margin: 0, padding: "7px 12px", fontSize: 12.5, whiteSpace: "pre", color: "var(--text)", flexShrink: 0, minWidth: 220 }}>{src}</pre>
+              <div className="text-xs flex-1" style={{ padding: "8px 12px", color: "var(--muted)", borderLeft: "1px solid var(--border)", lineHeight: 1.5 }}>{ex}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* recap: all thumb rules in one grid */}
+      {L.recap && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 mb-3">
+          {THUMB_RULES.map((r, i2) => (
+            <div key={i2} className="rounded-xl p-3" style={{ background: "var(--panel2)", border: "1px solid var(--border)" }}>
+              <div className="flex items-center gap-2 mb-1">
+                <span style={{ fontSize: 16 }}>{r.icon}</span>
+                <span style={{ fontWeight: 700, fontSize: 13 }}>{r.rule}</span>
+              </div>
+              <div className="text-xs" style={{ color: "var(--muted)", lineHeight: 1.5 }}>{r.why}</div>
+              {r.code && <div className="mono text-[11px] mt-1.5" style={{ color: "var(--operand)" }}>{r.code}</div>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* the lesson's thumb rule(s) */}
+      {(L.rules || []).map((r, ri) => (
+        <div key={ri} className="rounded-xl p-3 mb-2 flex items-start gap-2.5" style={{ background: "rgba(245,158,11,.08)", border: "1px solid var(--amber)" }}>
+          <span style={{ fontSize: 18 }}>{r.icon}</span>
+          <div>
+            <div className="text-[10.5px] font-bold uppercase tracking-wider" style={{ color: "var(--amber)" }}>Thumb rule</div>
+            <div style={{ fontSize: 13, fontWeight: 600 }}>{r.text}</div>
+            {r.why && <div className="text-xs mt-0.5" style={{ color: "var(--muted)" }}>{r.why}</div>}
+          </div>
+        </div>
+      ))}
+
+      <div className="flex items-center gap-2 mt-3 flex-wrap">
+        {L.code && <button className="btn" title="Put this example into the main editor and convert it" onClick={() => onLoad(L.code.map(r => r[0]).join("\n"))}><Ico d={I.play} />Load into editor</button>}
+        {L.sim && <button className="btn btn-primary" onClick={() => setMode("sim")}>▶ Watch it run in the Simulator</button>}
         <div className="flex-1" />
         <button className="btn" disabled={i === 0} onClick={() => setI(x => Math.max(0, x - 1))} style={i === 0 ? { opacity: .5 } : {}}>← Prev</button>
-        <button className="btn" disabled={i === POINTER_LESSONS.length - 1} onClick={() => setI(x => Math.min(POINTER_LESSONS.length - 1, x + 1))} style={i === POINTER_LESSONS.length - 1 ? { opacity: .5 } : {}}>Next →</button>
+        <button className={"btn " + (i < last ? "btn-primary" : "")} disabled={i === last} onClick={() => setI(x => Math.min(last, x + 1))} style={i === last ? { opacity: .5 } : {}}>Next lesson →</button>
       </div>
-      <p className="text-xs mt-4" style={{ color: "var(--muted)" }}>
-        Tip: pointer/register ops (LAR1, +AR1, LOOP, OPN) have no ladder symbol — they're shown as annotations. Use the <b>SIM</b> button to run the bit-logic lessons, and the calculator above to see any P# broken into area / byte / bit.
-      </p>
     </div>
   );
 }
