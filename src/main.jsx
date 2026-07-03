@@ -1506,7 +1506,76 @@ function ptrSimInit(demo) {
     if (t.length) st.lines.push({ mn: t[0].toUpperCase(), args: t.slice(1), src: ln.replace(/\s+$/, "") });
   });
   if (demo.init) demo.init(st);
+  st.code = demo.code; st.intro = demo.intro || "";
+  st.grids = demo.grids || deriveGrids(st);
   return st;
+}
+
+// derive memory grids to display from the areas a custom program touches
+function deriveGrids(st) {
+  const grids = [];
+  const mB = new Set(), iB = new Set(), qB = new Set();
+  const addN = (set, b, n) => { for (let k = 0; k < n; k++) set.add(b + k); };
+  st.lines.forEach(({ mn, args }) => {
+    args.forEach(a => {
+      const A = String(a).toUpperCase();
+      let m;
+      if ((m = A.match(/^M(\d+)\.[0-7]$/))) mB.add(+m[1]);
+      else if ((m = A.match(/^MB(\d+)$/))) mB.add(+m[1]);
+      else if ((m = A.match(/^MW(\d+)$/))) addN(mB, +m[1], 2);
+      else if ((m = A.match(/^MD(\d+)$/))) addN(mB, +m[1], 4);
+      else if ((m = A.match(/^P#M(\d+)\./))) mB.add(+m[1]);
+      else if ((m = A.match(/^\w*\[MD(\d+)\]$/))) addN(mB, +m[1], 4);
+      else if ((m = A.match(/^I(\d+)\.[0-7]$/))) iB.add(+m[1]);
+      else if ((m = A.match(/^IB(\d+)$/))) iB.add(+m[1]);
+      else if ((m = A.match(/^P#I(\d+)\./))) iB.add(+m[1]);
+      else if ((m = A.match(/^Q(\d+)\.[0-7]$/))) qB.add(+m[1]);
+      else if ((m = A.match(/^QB(\d+)$/))) qB.add(+m[1]);
+      else if ((m = A.match(/^P#Q(\d+)\./))) qB.add(+m[1]);
+      if (mn === "OPN") {
+        const db = A.match(/^DB(\d+)$/), di = A.match(/^DI(\d+)$/);
+        const n = db ? +db[1] : di ? +di[1] : null;
+        if (n != null) {
+          if (!st.dbs[n]) st.dbs[n] = new Array(32).fill(0);
+          grids.push({ label: "DB" + n + (di ? " (via DI)" : ""), area: "DB" + n, from: 0, count: 8 });
+        }
+      }
+    });
+  });
+  // cluster scattered byte references into up to a few short windows
+  const cluster = (set, area) => {
+    const arr = [...set].sort((x, y) => x - y);
+    if (!arr.length) return;
+    let start = arr[0], prev = arr[0];
+    // pad each window: loops step pointers past the statically visible bytes
+    const flush = (s, e) => { const count = Math.min(12, e - s + 1 + 5); grids.push({ label: area + " bytes " + s + "–" + (s + count - 1), area, from: s, count }); };
+    for (const b of arr.slice(1)) { if (b - prev > 6) { flush(start, prev); start = b; } prev = b; }
+    flush(start, prev);
+  };
+  cluster(mB, "M"); cluster(iB, "I"); cluster(qB, "Q");
+  const seen = new Set();
+  const out = grids.filter(g => { const k2 = g.area + ":" + g.from; if (seen.has(k2)) return false; seen.add(k2); return true; }).slice(0, 4);
+  return out.length ? out : [{ label: "M bytes 0–7", area: "M", from: 0, count: 8 }];
+}
+
+const PTRSIM_TEMPLATE = "      OPN   DB10           // source DB (gets sample data)\n      LAR1  P#DBX0.0       // AR1 → DB10 byte 0\n      LAR2  P#M20.0        // AR2 → flag byte 20\n      L     3              // copy 3 bytes DB10 → MB20..22\nNEXT: T     MW100          // store loop counter\n      L     B[AR1,P#0.0]\n      T     B[AR2,P#0.0]\n      +AR1  P#1.0\n      +AR2  P#1.0\n      L     MW100\n      LOOP  NEXT";
+
+function makeCustomDemo(codeText) {
+  return {
+    name: "Custom STL",
+    intro: "Your own code, stepped one instruction at a time. Grids below were auto-detected from the memory areas it uses; a DB opened with OPN DB is pre-seeded with 11, 22, 33… so reads have something to fetch. Click any cell to edit its value.",
+    code: codeText,
+    init: (st) => {
+      st.lines.forEach(({ mn, args }) => {
+        if (mn !== "OPN") return;
+        const m = String(args[0] || "").toUpperCase().match(/^DB(\d+)$/);
+        if (!m) return;
+        const n = +m[1];
+        if (!st.dbs[n]) st.dbs[n] = new Array(32).fill(0);
+        if (st.dbs[n].every(v => !v)) [11, 22, 33, 44, 55, 66, 77, 88].forEach((v, i2) => st.dbs[n][i2] = v);
+      });
+    },
+  };
 }
 function ptrSimStep(st) {
   if (st.done || st.pc >= st.lines.length) { st.done = true; return "✓ Program complete."; }
@@ -1685,15 +1754,16 @@ const PTRSIM_DEMOS = [
   },
 ];
 
-function PointerSim() {
-  const [demoIdx, setDemoIdx] = useState(0);
+function PointerSim({ editorCode }) {
+  const [sel, setSel] = useState("0");
+  const [customCode, setCustomCode] = useState(() => localStorage.getItem("stl_ptrsim_custom") || PTRSIM_TEMPLATE);
   const stRef = useRef(ptrSimInit(PTRSIM_DEMOS[0]));
   const [, setTick] = useState(0);
   const [running, setRunning] = useState(false);
-  const demo = PTRSIM_DEMOS[demoIdx];
   const st = stRef.current;
 
-  const reset = (idx = demoIdx) => { stRef.current = ptrSimInit(PTRSIM_DEMOS[idx]); setRunning(false); setTick(t => t + 1); };
+  const demoOf = (s, codeTxt) => s === "custom" ? makeCustomDemo(codeTxt) : PTRSIM_DEMOS[+s];
+  const reset = (s = sel, codeTxt = customCode) => { stRef.current = ptrSimInit(demoOf(s, codeTxt)); setRunning(false); setTick(t => t + 1); };
   const step = () => { ptrSimStep(stRef.current); setTick(t => t + 1); };
   useEffect(() => {
     if (!running) return;
@@ -1703,7 +1773,7 @@ function PointerSim() {
       setTick(t => t + 1);
     }, 550);
     return () => clearInterval(id);
-  }, [running, demoIdx]);
+  }, [running, sel]);
 
   // marker positions for AR1 / AR2 on the grids
   const marker = (r, set) => set ? ptrResolve(st, st[r], "", 0, 0) : null;
@@ -1720,14 +1790,31 @@ function PointerSim() {
   return (
     <div className="anim-in">
       <div className="flex items-center gap-2 mb-3 flex-wrap">
-        <select value={demoIdx} onChange={e => { setDemoIdx(+e.target.value); reset(+e.target.value); }}>
-          {PTRSIM_DEMOS.map((d, i) => <option key={i} value={i}>{d.name}</option>)}
+        <select value={sel} onChange={e => { setSel(e.target.value); reset(e.target.value); }}>
+          {PTRSIM_DEMOS.map((d, i) => <option key={i} value={String(i)}>{d.name}</option>)}
+          <option value="custom">✏️ My own STL…</option>
         </select>
         <button className="btn btn-primary" disabled={st.done} onClick={step} style={st.done ? { opacity: .5 } : {}}>Step ▸</button>
         <button className="btn" onClick={() => setRunning(r => !r)} disabled={st.done} style={st.done ? { opacity: .5 } : {}}>{running ? "Pause" : "Run ▸▸"}</button>
         <button className="btn" onClick={() => reset()}><Ico d={I.reset} />Reset</button>
       </div>
-      <p className="text-xs mb-3" style={{ color: "var(--muted)", lineHeight: 1.5 }}>{demo.intro}</p>
+
+      {sel === "custom" && (
+        <div className="mb-3">
+          <textarea className="mono w-full" rows={11} spellCheck={false} value={customCode}
+            onChange={e => setCustomCode(e.target.value)} wrap="off"
+            style={{ background: "var(--editorbg)", border: "1px solid var(--border)", borderRadius: 10, padding: 10, fontSize: 12.5, lineHeight: "19px", color: "var(--text)", whiteSpace: "pre", overflow: "auto", boxSizing: "border-box", outline: "none", resize: "vertical" }} />
+          <div className="flex items-center gap-2 mt-2 flex-wrap">
+            <button className="btn btn-primary" onClick={() => { try { localStorage.setItem("stl_ptrsim_custom", customCode); } catch (e) {} reset("custom", customCode); }}><Ico d={I.check} />Apply &amp; Reset</button>
+            {editorCode != null && <button className="btn" title="Copy the STL from the main editor into this box" onClick={() => setCustomCode(editorCode)}><Ico d={I.doc} />Copy from editor</button>}
+          </div>
+          <p className="text-[11px] mt-2" style={{ color: "var(--muted)", lineHeight: 1.5 }}>
+            Simulated here: OPN (DB/DI) · LAR1/2 · TAR1/2 · CAR · +AR1/2 · L / T (direct, B[AR1,P#..], M[MD40]) · LOOP / JU + labels · SET / CLR · A / AN / = / S / R.
+            Anything else is skipped with a note. Memory grids are auto-detected from your code; a DB opened with <span className="mono">OPN DB</span> gets sample data 11, 22, 33… and you can click any cell to edit its value.
+          </p>
+        </div>
+      )}
+      {sel !== "custom" && <p className="text-xs mb-3" style={{ color: "var(--muted)", lineHeight: 1.5 }}>{st.intro}</p>}
 
       {/* registers */}
       <div className="grid grid-cols-3 sm:grid-cols-6 gap-2 mb-3">
@@ -1741,7 +1828,7 @@ function PointerSim() {
 
       {/* memory grids */}
       <div className="flex gap-3 flex-wrap mb-3">
-        {demo.grids.map((g, gi) => {
+        {(st.grids || []).map((g, gi) => {
           const bytes = g.area === "M" ? st.M : g.area === "Q" ? st.Q : g.area === "I" ? st.I : (st.dbs[+g.area.slice(2)] || []);
           return (
             <div key={gi} className="rounded-xl p-2.5" style={{ background: "var(--panel2)", border: "1px solid var(--border)" }}>
@@ -1757,8 +1844,15 @@ function PointerSim() {
                       <div className="text-[9px] mono h-3.5" style={{ color: isAR1 ? "var(--amber)" : isAR2 ? "var(--accent)" : "transparent", fontWeight: 700 }}>
                         {isAR1 && isAR2 ? "A1+2" : isAR1 ? "AR1▾" : isAR2 ? "AR2▾" : "·"}
                       </div>
-                      <div className="mono flex items-center justify-center" style={{
-                        width: 34, height: 30, borderRadius: 6, fontSize: 12, fontWeight: 700,
+                      <div className="mono flex items-center justify-center" title={"Click to edit " + g.area + " byte " + idx}
+                        onClick={() => {
+                          const v = window.prompt("Set " + g.area + " byte " + idx + " (0–255):", String(bytes[idx] || 0));
+                          if (v === null) return;
+                          bytes[idx] = Math.max(0, Math.min(255, parseInt(v, 10) || 0));
+                          setTick(t => t + 1);
+                        }}
+                        style={{
+                        width: 34, height: 30, borderRadius: 6, fontSize: 12, fontWeight: 700, cursor: "pointer",
                         border: "2px solid " + (isAR1 ? "var(--amber)" : isAR2 ? "var(--accent)" : "var(--border)"),
                         background: wrote ? "rgba(45,255,143,.18)" : "var(--editorbg)",
                         color: wrote ? "#2dff8f" : (bytes[idx] ? "var(--text)" : "var(--muted)"),
@@ -1776,7 +1870,7 @@ function PointerSim() {
       <div className="flex gap-3 flex-wrap">
         {/* code listing with program counter */}
         <pre className="mono flex-1" style={{ minWidth: 300, background: "var(--editorbg)", border: "1px solid var(--border)", borderRadius: 10, padding: "10px 0", fontSize: 12, lineHeight: "19px", overflow: "auto", whiteSpace: "pre", margin: 0 }}>
-          {demo.code.split("\n").map((ln, i2) => {
+          {(st.code || "").split("\n").map((ln, i2) => {
             // map source line to instruction index (labels stripped in engine)
             const active = !st.done && st.lines[st.pc] && ln.replace(/\s+$/, "") === st.lines[st.pc].src;
             return <div key={i2} style={{ padding: "0 12px", background: active ? "rgba(0,212,255,.14)" : "transparent", borderLeft: active ? "3px solid var(--accent)" : "3px solid transparent" }}>{ln || " "}</div>;
@@ -1796,7 +1890,7 @@ function PointerSim() {
   );
 }
 
-function PointerSchool({ onLoad }) {
+function PointerSchool({ onLoad, editorCode }) {
   const [mode, setMode] = useState("lessons");
   const [i, setI] = useState(0);
   const L = POINTER_LESSONS[i];
@@ -1807,7 +1901,7 @@ function PointerSchool({ onLoad }) {
           <button className="btn" onClick={() => setMode("lessons")}>📖 Lessons</button>
           <button className="btn !border-[var(--accent)] !text-[var(--accent)]">▶ Pointer Simulator</button>
         </div>
-        <PointerSim />
+        <PointerSim editorCode={editorCode} />
       </div>
     );
   }
@@ -2156,7 +2250,7 @@ function App() {
             )}
             {tab==="xref" && <CrossRefTable rows={crossRef} />}
             {tab==="errors" && <Messages items={allWarnings} onJump={()=>setTab("ladder")} />}
-            {tab==="learn" && <PointerSchool onLoad={(c) => { setCode(c); setDebounced(c); setTab("ladder"); }} />}
+            {tab==="learn" && <PointerSchool editorCode={code} onLoad={(c) => { setCode(c); setDebounced(c); setTab("ladder"); }} />}
           </div>
         </section>
       </div>
