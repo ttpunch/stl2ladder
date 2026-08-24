@@ -8,7 +8,7 @@ const css = readFileSync("src/index.css", "utf8")
 
 let js = readFileSync("src/main.jsx", "utf8")
   .replace(/^import .*\n/gm, "")          // strip ES imports (UMD globals used instead)
-  .replace(/\n?createRoot\(document\.getElementById\("root"\)\)\.render\(<App \/>\);\s*$/, "")
+  .replace(/\n?createRoot\(document\.getElementById\("root"\)\)\.render\([\s\S]*$/, "")
   .trim();
 
 const html = `<!DOCTYPE html>
@@ -35,7 +35,7 @@ const { useState, useEffect, useMemo, useRef, useCallback } = React;
 
 ${js}
 
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+ReactDOM.createRoot(document.getElementById("root")).render(<AuthGate>{(signOut) => <App onSignOut={signOut} />}</AuthGate>);
 <\/script>
 </body>
 </html>

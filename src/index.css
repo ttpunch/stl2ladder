@@ -91,6 +91,18 @@
   .btn-primary:hover{filter:brightness(1.1);color:#04121a}
   .tab{padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer;border-bottom:2px solid transparent;color:var(--muted)}
   .tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+  /* draggable divider between the STL editor and the ladder output */
+  .splitter{flex:0 0 6px;position:relative;cursor:col-resize;background:var(--panel);
+    border-left:1px solid var(--border);border-right:1px solid var(--border);
+    display:flex;align-items:center;justify-content:center;touch-action:none;transition:background .15s}
+  .splitter:hover,.splitter.active,.splitter:focus-visible{background:var(--accent);outline:none}
+  .splitter-grip{width:2px;height:34px;border-radius:2px;background:var(--border);transition:background .15s}
+  .splitter:hover .splitter-grip,.splitter.active .splitter-grip,.splitter:focus-visible .splitter-grip{background:#04121a}
+  /* while dragging, don't let the pointer select text or land on the iframe-ish panes */
+  .splitting{user-select:none;cursor:col-resize}
+  .splitting .ta,.splitting section{pointer-events:none}
+  .splitting .splitter{pointer-events:auto}
+
   .anim-in{animation:fadeUp .35s ease both}
   @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
   select{background:var(--panel2);color:var(--text);border:1px solid var(--border);
