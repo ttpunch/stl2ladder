@@ -101,6 +101,18 @@
   .btn-primary:hover{filter:brightness(1.1);color:#04121a}
   .tab{padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer;border-bottom:2px solid transparent;color:var(--muted)}
   .tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+  /* draggable divider between the STL editor and the ladder output */
+  .splitter{flex:0 0 6px;position:relative;cursor:col-resize;background:var(--panel);
+    border-left:1px solid var(--border);border-right:1px solid var(--border);
+    display:flex;align-items:center;justify-content:center;touch-action:none;transition:background .15s}
+  .splitter:hover,.splitter.active,.splitter:focus-visible{background:var(--accent);outline:none}
+  .splitter-grip{width:2px;height:34px;border-radius:2px;background:var(--border);transition:background .15s}
+  .splitter:hover .splitter-grip,.splitter.active .splitter-grip,.splitter:focus-visible .splitter-grip{background:#04121a}
+  /* while dragging, don't let the pointer select text or land on the iframe-ish panes */
+  .splitting{user-select:none;cursor:col-resize}
+  .splitting .ta,.splitting section{pointer-events:none}
+  .splitting .splitter{pointer-events:auto}
+
   .anim-in{animation:fadeUp .35s ease both}
   @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
   select{background:var(--panel2);color:var(--text);border:1px solid var(--border);
@@ -1257,7 +1269,8 @@ const I = {
   globe:"M12 2a10 10 0 100 20 10 10 0 000-20M2 12h20M12 2a15 15 0 010 20M12 2a15 15 0 000 20",
   x:"M18 6L6 18M6 6l12 12", check:"M20 6L9 17l-5-5", upload:"M12 3v12M8 7l4-4 4 4M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2",
   shutter:"M12 2a10 10 0 100 20 10 10 0 000-20zM12 7a5 5 0 100 10 5 5 0 000-10z",
-  help:"M12 2a10 10 0 100 20 10 10 0 000-20M9.1 9a3 3 0 015.8 1c0 2-3 3-3 3M12 17h.01"
+  help:"M12 2a10 10 0 100 20 10 10 0 000-20M9.1 9a3 3 0 015.8 1c0 2-3 3-3 3M12 17h.01",
+  logout:"M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9"
 };
 
 /* ============================================================= *
@@ -2303,7 +2316,13 @@ function AuthGate({ children }) {
 
   useEffect(() => { if (!authed && inputRef.current) inputRef.current.focus(); }, [authed]);
 
-  if (authed) return children;
+  const signOut = useCallback(() => {
+    localStorage.removeItem("stl_auth_ok");
+    setPw(""); setErr(false); setAuthed(false);
+  }, []);
+
+  // children may be a render function so the app can offer a "Sign out" action
+  if (authed) return typeof children === "function" ? children(signOut) : children;
 
   const submit = async (e) => {
     e.preventDefault();
@@ -2337,7 +2356,7 @@ function AuthGate({ children }) {
 /* ============================================================= *
  *  MAIN APP
  * ============================================================= */
-function App() {
+function App({ onSignOut }) {
   const [dark, setDark] = useState(true);
   const [code, setCode] = useState(() => localStorage.getItem("stl_code") || EXAMPLES.motor.code);
   const [debounced, setDebounced] = useState(code);
@@ -2354,6 +2373,57 @@ function App() {
   const simMem = useRef(createSimMemory());
   const taRef = useRef(null), hlRef = useRef(null), gutterRef = useRef(null), scrollRef = useRef(null);
   const svgWrapRef = useRef(null);
+
+  // resizable editor / output split (percentage of the row taken by the editor)
+  const [split, setSplit] = useState(() => {
+    const v = parseFloat(localStorage.getItem("stl_split"));
+    return Number.isFinite(v) ? clampSplit(v) : 50;
+  });
+  const [dragging, setDragging] = useState(false);
+  const draggingRef = useRef(false); // handlers read this, not the state (avoids a stale closure)
+  const [isWide, setIsWide] = useState(() => window.matchMedia("(min-width: 1024px)").matches);
+  const bodyRef = useRef(null);
+
+  // the split only exists in the side-by-side layout (Tailwind's lg: breakpoint).
+  // window resize is watched too — matchMedia alone can miss programmatic viewport changes.
+  useEffect(() => {
+    const mq = window.matchMedia("(min-width: 1024px)");
+    const on = () => setIsWide(mq.matches);
+    mq.addEventListener("change", on);
+    window.addEventListener("resize", on);
+    on();
+    return () => { mq.removeEventListener("change", on); window.removeEventListener("resize", on); };
+  }, []);
+  useEffect(() => { localStorage.setItem("stl_split", String(split)); }, [split]);
+
+  const splitFromX = (clientX) => {
+    const r = bodyRef.current && bodyRef.current.getBoundingClientRect();
+    if (!r || !r.width) return null;
+    return clampSplit(((clientX - r.left) / r.width) * 100);
+  };
+  const onSplitDown = (e) => {
+    e.preventDefault();
+    try { e.currentTarget.setPointerCapture(e.pointerId); } catch (err) {}
+    draggingRef.current = true;
+    setDragging(true);
+  };
+  const onSplitMove = (e) => {
+    if (!draggingRef.current) return;
+    const v = splitFromX(e.clientX);
+    if (v != null) setSplit(v);
+  };
+  const endSplitDrag = (e) => {
+    if (!draggingRef.current) return;
+    draggingRef.current = false;
+    setDragging(false);
+    try { e.currentTarget.releasePointerCapture(e.pointerId); } catch (err) {}
+  };
+  const onSplitKey = (e) => {
+    const step = e.shiftKey ? 10 : 2;
+    if (e.key === "ArrowLeft") { e.preventDefault(); setSplit(v => clampSplit(v - step)); }
+    else if (e.key === "ArrowRight") { e.preventDefault(); setSplit(v => clampSplit(v + step)); }
+    else if (e.key === "Home" || e.key === "Enter") { e.preventDefault(); setSplit(50); }
+  };
 
   useEffect(() => { localStorage.setItem("stl_code", code); }, [code]);
   useEffect(() => { const t = setTimeout(() => setDebounced(code), 300); return () => clearTimeout(t); }, [code]);
@@ -2522,12 +2592,19 @@ function App() {
         <button className="btn" onClick={() => setDark(d => !d)}>
           <Ico d={dark ? I.sun : I.moon}/>{dark ? "Light" : "Dark"}
         </button>
+        {onSignOut && (
+          <button className="btn" title="Lock the tool and return to the password screen" onClick={onSignOut}>
+            <Ico d={I.logout}/>Sign out
+          </button>
+        )}
       </header>
 
       {/* BODY */}
-      <div className="flex-1 flex flex-col lg:flex-row min-h-0">
+      <div ref={bodyRef} className={"flex-1 flex flex-col lg:flex-row min-h-0" + (dragging ? " splitting" : "")}>
         {/* LEFT: EDITOR */}
-        <section className="no-print flex flex-col lg:w-1/2 min-h-0 lg:border-r" style={{ borderColor:"var(--border)", height:"100%" }}>
+        <section className="no-print flex flex-col min-h-0 lg:border-r"
+                 style={{ borderColor:"var(--border)", height:"100%",
+                          ...(isWide && !fs ? { flex: `0 0 ${split}%`, width: `${split}%`, minWidth: 0 } : {}) }}>
           <div className="px-4 py-2 flex items-center justify-between" style={{ background:"var(--panel)", borderBottom:"1px solid var(--border)" }}>
             <span className="text-xs font-semibold uppercase tracking-wider" style={{color:"var(--muted)"}}>STL Source</span>
             <span className="text-xs mono" style={{color:"var(--muted)"}}>{lineCount} lines</span>
@@ -2555,9 +2632,24 @@ function App() {
           </div>
         </section>
 
+        {/* DRAG HANDLE */}
+        {isWide && !fs && (
+          <div className={"splitter no-print" + (dragging ? " active" : "")}
+               role="separator" aria-orientation="vertical" tabIndex={0}
+               aria-label="Resize editor and ladder panes"
+               aria-valuenow={Math.round(split)} aria-valuemin={18} aria-valuemax={82}
+               title="Drag to resize · double-click to reset · ← → to nudge"
+               onPointerDown={onSplitDown} onPointerMove={onSplitMove}
+               onPointerUp={endSplitDrag} onPointerCancel={endSplitDrag}
+               onDoubleClick={() => setSplit(50)} onKeyDown={onSplitKey}>
+            <span className="splitter-grip" />
+          </div>
+        )}
+
         {/* RIGHT: OUTPUT */}
-        <section className={"flex flex-col min-h-0 print-full " + (fs ? "fixed inset-0 z-50" : "lg:w-1/2")}
-                 style={{ height:"100%", background:"var(--panel)" }}>
+        <section className={"flex flex-col min-h-0 print-full " + (fs ? "fixed inset-0 z-50" : "")}
+                 style={{ height:"100%", background:"var(--panel)",
+                          ...(fs ? {} : isWide ? { flex: "1 1 0%", minWidth: 0 } : {}) }}>
           <div className="no-print flex items-center px-2" style={{ background:"var(--panel)", borderBottom:"1px solid var(--border)" }}>
             <div className={"tab "+(tab==="ladder"?"active":"")} onClick={()=>setTab("ladder")}>Ladder</div>
             <div className={"tab "+(tab==="xref"?"active":"")} onClick={()=>setTab("xref")}>Cross-Ref ({crossRef.length})</div>
@@ -2620,6 +2712,9 @@ function App() {
     </div>
   );
 }
+
+// editor/output split is kept between 18% and 82% so neither pane can vanish
+function clampSplit(v) { return Math.min(82, Math.max(18, Math.round(v * 10) / 10)); }
 
 function Empty({ msg }) {
   return <div className="h-full flex items-center justify-center text-center px-8" style={{color:"var(--muted)"}}>
@@ -2723,9 +2818,7 @@ function triggerDownload(url, name) {
   const a = document.createElement("a"); a.href = url; a.download = name; a.click();
 }
 
-createRoot(document.getElementById("root")).render(<AuthGate><App /></AuthGate>);
-
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+ReactDOM.createRoot(document.getElementById("root")).render(<AuthGate>{(signOut) => <App onSignOut={signOut} />}</AuthGate>);
 </script>
 </body>
 </html>
