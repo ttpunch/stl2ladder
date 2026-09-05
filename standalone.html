@@ -240,12 +240,9 @@ function tokenizeLine(raw) {
     const c = line[i];
     if (c === " " || c === "\t") { i++; continue; }
     if (c === "(" || c === ")" || c === ",") { tokens.push(c); i++; continue; }
-    if (c === '"') {
-      let j = i + 1;
-      while (j < line.length && line[j] !== '"') j++;
-      tokens.push(line.slice(i, j + 1)); i = j + 1; continue;
-    }
-    // read a token; keep [...] indirect-address content (and quotes) intact
+    // read a token; keep [...] indirect-address content (and quotes) intact.
+    // A quoted symbol may carry a member tail — "DbM".MODAL_M[287] is ONE operand,
+    // so the scan must run past the closing quote instead of stopping on it.
     let j = i, depth = 0, q = false;
     while (j < line.length) {
       const ch = line[j];
@@ -530,11 +527,55 @@ function parseNetwork(net) {
 /* ============================================================= *
  *  SVG LAYOUT
  * ============================================================= */
-const SYM = 82, BOX_W = 140, BOX_H = 86, LANE_H = 94, RAIL_L = 46, NET_HDR = 74;
+const SYM = 82, BOX_W = 140, BOX_H = 86, LANE_H = 108, RAIL_L = 46, NET_HDR = 74;
+const SYM_BODY = 28;   // the ─┤ ├─ / ─( )─ glyph itself is always this wide
+const CELL_PAD = 20;   // clear gap kept between one cell's label and the next
+
+/* ---- text metrics -------------------------------------------------------
+ * Cells used to be a fixed SYM wide, so a symbolic operand any longer than
+ * ~11 characters ran straight over its neighbours' labels. Cells are now
+ * sized from the label they have to carry, and long names are wrapped onto
+ * two lines so the diagram grows sideways only as much as it must.        */
+const monoW  = (s, fs) => String(s || "").length * fs * 0.605;  // JetBrains Mono
+const interW = (s, fs) => String(s || "").length * fs * 0.5;    // Inter (approx)
+
+const LBL_MAX = 15;
+// break a long operand into (at most) two balanced lines at a natural seam
+function wrapLabel(nm) {
+  nm = String(nm || "");
+  if (nm.length <= LBL_MAX) return [nm];
+  const mid = nm.length / 2;
+  let best = -1;
+  for (let i = 1; i < nm.length; i++) {
+    const prev = nm[i - 1], ch = nm[i];
+    const seam = prev === "." || prev === "_" || ch === "[" ||
+                 (/[a-z0-9]/.test(prev) && /[A-Z]/.test(ch));
+    if (seam && (best < 0 || Math.abs(i - mid) < Math.abs(best - mid))) best = i;
+  }
+  if (best < 0 || Math.abs(best - mid) > nm.length * 0.32) best = Math.ceil(mid);
+  return [nm.slice(0, best), nm.slice(best)];
+}
+const labelW = (nm) => Math.max(...wrapLabel(nm).map(l => monoW(l, 12)));
+
+// width a cell needs so its operand name + extracted address both fit
+function cellFor(operand, comment) {
+  const nm = disp(operand);
+  const { addr } = splitComment(nm, comment);
+  let w = labelW(nm);
+  if (addr && addr !== nm) w = Math.max(w, monoW(addr, 10));
+  return Math.max(SYM, Math.ceil(w) + CELL_PAD);
+}
+function contactW(n) {
+  if (!n) return 70;
+  if (n.kind === "COMPARE" || n.kind === "NOT")
+    return Math.max(SYM, Math.ceil(monoW(n.operand, 13)) + 36 + CELL_PAD);
+  return cellFor(n.operand, n.comment);
+}
+const coilW = (o) => cellFor(o.operand, o.comment);
 
 function measure(n) {
   if (!n) return { w: 70, lanes: 1 };
-  if (n.type === "CONTACT") return { w: SYM, lanes: 1 };
+  if (n.type === "CONTACT") return { w: contactW(n), lanes: 1 };
   if (n.type === "SERIES") {
     let w = 0, l = 1;
     n.children.forEach(c => { const m = measure(c); w += m.w; l = Math.max(l, m.lanes); });
@@ -695,8 +736,8 @@ function Ladder({ networks, themeKey, zoom = 1, xlate, sim }) {
     networks.forEach(net => {
       net.rungs.forEach((rung, ri) => {
         const m = measure(rung.logic);
-        const anyBox = (rung.outputs || []).some(o => ["TIMER","COUNTER","FBCALL","MOVE","JUMP","BOX","FUNC"].includes(o.kind));
-        const outW = anyBox ? BOX_W : SYM;
+        const outW = Math.max(SYM, ...(rung.outputs || []).map(o =>
+          ["TIMER","COUNTER","FBCALL","MOVE","JUMP","BOX","FUNC"].includes(o.kind) ? BOX_W : coilW(o)));
         const need = RAIL_L + 12 + m.w + 50 + outW + 12 + RAIL_L;
         rows.push({ net, rung, ri, mw: m.w, lanes: m.lanes, outW, need });
       });
@@ -714,7 +755,7 @@ function Ladder({ networks, themeKey, zoom = 1, xlate, sim }) {
   const rightRailX = width - RAIL_L;
 
   // render the extracted absolute address (if hidden in a symbol) and the description
-  function drawIODetail(operand, comment, cx, yy) {
+  function drawIODetail(operand, comment, cx, yy, cw) {
     const { name, addr, detail } = splitComment(operand, comment);
     let y2 = yy;
     if (addr && addr !== name) {
@@ -722,8 +763,19 @@ function Ladder({ networks, themeKey, zoom = 1, xlate, sim }) {
       y2 += 13;
     }
     if (detail) {
-      els.push(<text key={k()} className="opcomment" x={cx} y={y2} textAnchor="middle">{trunc(detail, 24)}</text>);
+      // keep the description inside its own cell instead of a fixed 24 chars
+      const cap = Math.max(6, Math.floor((cw || SYM) / interW("x", 9.5)) - 1);
+      els.push(<text key={k()} className="opcomment" x={cx} y={y2} textAnchor="middle">{trunc(detail, cap)}</text>);
     }
+  }
+
+  // operand name above a symbol, wrapped onto two lines when it is long
+  function drawLabel(nm, cx, baseY) {
+    const lines = wrapLabel(nm);
+    const cls = isAddr(nm) ? addrClass(nm) : "operand";
+    lines.forEach((ln, i) => els.push(
+      <text key={k()} className={cls} x={cx} y={baseY - (lines.length - 1 - i) * 13} textAnchor="middle">{ln}</text>
+    ));
   }
 
   // wire class helper: bright green when carrying simulated power
@@ -741,22 +793,23 @@ function Ladder({ networks, themeKey, zoom = 1, xlate, sim }) {
       default: return false;
     }
   }
-  function pushClickZone(n, x, cy) {
+  function pushClickZone(n, x, cy, cw) {
     if (!sim || !simToggleKey(n)) return;
-    els.push(<rect key={k()} x={x} y={cy-34} width={SYM} height={68} fill="rgba(0,0,0,0)"
+    els.push(<rect key={k()} x={x} y={cy-34} width={cw} height={68} fill="rgba(0,0,0,0)"
       style={{ cursor: "pointer", pointerEvents: "all" }} onClick={() => sim.onToggle(n)} />);
   }
 
-  function drawContact(n, x, cy, pw, out) {
-    const b1 = x + 26, b2 = x + 54, tp = cy - 16, bt = cy + 16;
+  function drawContact(n, x, cy, pw, out, cw) {
+    const mid = x + cw / 2;
+    const b1 = mid - SYM_BODY / 2, b2 = mid + SYM_BODY / 2, tp = cy - 16, bt = cy + 16;
     els.push(<line key={k()} className={wcls(pw)} x1={x} y1={cy} x2={b1} y2={cy} />);
-    els.push(<line key={k()} className={wcls(out)} x1={b2} y1={cy} x2={x + SYM} y2={cy} />);
+    els.push(<line key={k()} className={wcls(out)} x1={b2} y1={cy} x2={x + cw} y2={cy} />);
     const closed = sim ? contactClosed(n) : false;
     if (n.kind === "COMPARE" || n.kind === "NOT") {
-      els.push(<rect key={k()} className={"boxrect" + (sim && closed && n.kind === "COMPARE" ? " liveborder" : "")} x={x+18} y={cy-18} width={SYM-36} height={36} rx="3" />);
-      els.push(<text key={k()} className="symtext" x={x+SYM/2} y={cy+4} textAnchor="middle">{n.operand}</text>);
-      drawIODetail(n.operand, tr(n.comment), x+SYM/2, cy+32);
-      pushClickZone(n, x, cy);
+      els.push(<rect key={k()} className={"boxrect" + (sim && closed && n.kind === "COMPARE" ? " liveborder" : "")} x={x+18} y={cy-18} width={cw-36} height={36} rx="3" />);
+      els.push(<text key={k()} className="symtext" x={mid} y={cy+4} textAnchor="middle">{n.operand}</text>);
+      drawIODetail(n.operand, tr(n.comment), mid, cy+32, cw);
+      pushClickZone(n, x, cy, cw);
       return;
     }
     const ccls = "contact" + (sim && closed ? " live" : "");
@@ -766,13 +819,13 @@ function Ladder({ networks, themeKey, zoom = 1, xlate, sim }) {
     if (n.kind === "XOR") els.push(<text key={k()} className="symtext" x={(b1+b2)/2} y={cy+5} textAnchor="middle">{n.xn ? "X̄" : "X"}</text>);
     if (n.kind === "PEDGE" || n.kind === "NEDGE") els.push(<text key={k()} className="symtext" x={(b1+b2)/2} y={cy+5} textAnchor="middle">{n.kind === "PEDGE" ? "P" : "N"}</text>);
     const nm = disp(n.operand);
-    els.push(<text key={k()} className={isAddr(nm) ? addrClass(nm) : "operand"} x={(b1+b2)/2} y={tp-8} textAnchor="middle">{nm}</text>);
+    drawLabel(nm, mid, tp-8);
     if (sim && ["NO","NC","XOR"].includes(n.kind)) {
       const on = simBit(sim.mem, n.operand);
-      els.push(<circle key={k()} cx={(b1+b2)/2} cy={bt+8} r={3.5} className={on ? "livefill" : ""} style={on ? {} : { fill: "var(--border)" }} />);
+      els.push(<circle key={k()} cx={mid} cy={bt+8} r={3.5} className={on ? "livefill" : ""} style={on ? {} : { fill: "var(--border)" }} />);
     }
-    drawIODetail(n.operand, tr(n.comment), (b1+b2)/2, cy+32);
-    pushClickZone(n, x, cy);
+    drawIODetail(n.operand, tr(n.comment), mid, cy+32, cw);
+    pushClickZone(n, x, cy, cw);
   }
 
   // returns { x: xEnd, out: power leaving this node } — out is null when sim is off
@@ -785,8 +838,9 @@ function Ladder({ networks, themeKey, zoom = 1, xlate, sim }) {
         else if (n.kind === "XOR") out = (pw !== contactClosed(n));
         else out = pw && contactClosed(n);
       }
-      drawContact(n, x, cy, pw, out);
-      return { x: x + SYM, out };
+      const cw = contactW(n);
+      drawContact(n, x, cy, pw, out, cw);
+      return { x: x + cw, out };
     }
     if (n.type === "SERIES") {
       let cx = x, p = pw;
@@ -815,12 +869,12 @@ function Ladder({ networks, themeKey, zoom = 1, xlate, sim }) {
     return { x, out: pw };
   }
 
-  function drawCoil(out, x, cy, rlo) {
-    const a = x + 26, b = x + 56;
+  function drawCoil(out, x, cy, rlo, cw) {
+    const mid = x + cw / 2, a = mid - 15, b = mid + 15;
     // energized: "=" coils show their bit state; S/R/edge coils show the acting RLO
     const hot = sim ? (out.kind === "COIL" ? simBit(sim.mem, out.operand) : !!rlo) : false;
     els.push(<line key={k()} className={wcls(rlo)} x1={x} y1={cy} x2={a} y2={cy} />);
-    els.push(<line key={k()} className={wcls(hot)} x1={b} y1={cy} x2={x+SYM} y2={cy} />);
+    els.push(<line key={k()} className={wcls(hot)} x1={b} y1={cy} x2={x+cw} y2={cy} />);
     const sr = out.kind !== "COIL";
     const cls = (sr ? "coil-sr" : "coil") + (hot ? " live" : "");
     els.push(<path key={k()} className={cls} d={`M ${a} ${cy-17} Q ${a-13} ${cy} ${a} ${cy+17}`} />);
@@ -828,12 +882,12 @@ function Ladder({ networks, themeKey, zoom = 1, xlate, sim }) {
     const letter = { SET:"S", RESET:"R", PEDGE:"P", NEDGE:"N" }[out.kind];
     if (letter) els.push(<text key={k()} className={sr?"coiltext-sr":"coiltext"} x={(a+b)/2} y={cy+5} textAnchor="middle">{letter}</text>);
     const nm = disp(out.operand);
-    els.push(<text key={k()} className={isAddr(nm) ? addrClass(nm) : "operand"} x={(a+b)/2} y={cy-24} textAnchor="middle">{nm}</text>);
+    drawLabel(nm, mid, cy-24);
     if (sim) {
       const on = simBit(sim.mem, out.operand);
-      els.push(<circle key={k()} cx={(a+b)/2} cy={cy+24} r={3.5} className={on ? "livefill" : ""} style={on ? {} : { fill: "var(--border)" }} />);
+      els.push(<circle key={k()} cx={mid} cy={cy+24} r={3.5} className={on ? "livefill" : ""} style={on ? {} : { fill: "var(--border)" }} />);
     }
-    drawIODetail(out.operand, tr(out.comment), (a+b)/2, cy+36);
+    drawIODetail(out.operand, tr(out.comment), mid, cy+36, cw);
   }
 
   function drawBox(out, x, cy, rlo) {
@@ -866,7 +920,7 @@ function Ladder({ networks, themeKey, zoom = 1, xlate, sim }) {
       els.push(<text key={k()} className="boxtext" x={bx+bw/2} y={top+40+i*18} textAnchor="middle">{ln}</text>);
     });
     if (simLine) els.push(<text key={k()} className="simval" x={bx+bw/2} y={top+BOX_H-6} textAnchor="middle">{simLine}</text>);
-    drawIODetail(out.operand || out.dst || out.label, tr(out.comment), bx+bw/2, top+BOX_H+14);
+    drawIODetail(out.operand || out.dst || out.label, tr(out.comment), bx+bw/2, top+BOX_H+14, bw);
   }
 
   networks.forEach(net => {
@@ -899,16 +953,19 @@ function Ladder({ networks, themeKey, zoom = 1, xlate, sim }) {
     els.push(<text key={k()} x={26} y={y+22} style={{ fill: nc, fontFamily: "Inter", fontSize: "13px", fontWeight: 700 }}>{"NETWORK " + net.number}</text>);
     if (net.title) els.push(<text key={k()} className="netsub" x={26} y={y+39}>{net.title}</text>);
     if (net.hasUnsupported) els.push(<text key={k()} className="netsub" x={width-16} y={y+22} textAnchor="end" style={{fill:"var(--amber)"}}>⚠ contains annotations</text>);
-    if (ins.length) els.push(<text key={k()} className="iolab-i" x={26} y={y+59}>{"IN ▸ " + trunc(ins.join(", "), 52)}</text>);
-    if (outs.length) els.push(<text key={k()} className="iolab-q" x={width-16} y={y+59} textAnchor="end">{"OUT ▸ " + trunc(outs.join(", "), 40)}</text>);
+    // split the header line between IN and OUT by how wide the diagram actually is
+    const hdrChars = Math.max(14, Math.floor((width - 60) / monoW("x", 11)));
+    const inCap = outs.length ? Math.floor(hdrChars * 0.55) : hdrChars;
+    const outCap = ins.length ? hdrChars - inCap - 6 : hdrChars;
+    if (ins.length) els.push(<text key={k()} className="iolab-i" x={26} y={y+59}>{"IN ▸ " + trunc(ins.join(", "), inCap)}</text>);
+    if (outs.length) els.push(<text key={k()} className="iolab-q" x={width-16} y={y+59} textAnchor="end">{"OUT ▸ " + trunc(outs.join(", "), outCap)}</text>);
     y += NET_HDR;
 
     net.rungs.forEach(rung => {
       const m = measure(rung.logic);
       const outputs = rung.outputs || [];
       const isBox = (o) => ["TIMER","COUNTER","FBCALL","MOVE","JUMP","BOX","FUNC"].includes(o.kind);
-      const anyBox = outputs.some(isBox);
-      const outW = anyBox ? BOX_W : SYM;
+      const outW = Math.max(SYM, ...outputs.map(o => isBox(o) ? BOX_W : coilW(o)));
       const laneCount = Math.max(m.lanes, Math.max(1, outputs.length));
       const h = laneCount * LANE_H;
       const cy = y + h/2;
@@ -935,10 +992,15 @@ function Ladder({ networks, themeKey, zoom = 1, xlate, sim }) {
         if (N > 1) els.push(<line key={k()} className={wcls(rlo)} x1={branchX} y1={centers[0]} x2={branchX} y2={centers[N-1]} />);
         outputs.forEach((o, i) => {
           const ocy = N > 1 ? centers[i] : cy;
-          const ow = isBox(o) ? BOX_W : SYM;
-          els.push(<line key={k()} className={wcls(rlo)} x1={branchX} y1={ocy} x2={xOut} y2={ocy} />);
-          if (isBox(o)) drawBox(o, xOut, ocy, rlo); else drawCoil(o, xOut, ocy, rlo);
-          els.push(<line key={k()} className={wcls(rlo)} x1={xOut + ow} y1={ocy} x2={rightRailX} y2={ocy} />);
+          if (isBox(o)) {
+            const bxX = xOut + (outW - BOX_W) / 2;   // boxes stay a fixed size, centred in the column
+            els.push(<line key={k()} className={wcls(rlo)} x1={branchX} y1={ocy} x2={bxX} y2={ocy} />);
+            drawBox(o, bxX, ocy, rlo);
+            els.push(<line key={k()} className={wcls(rlo)} x1={bxX + BOX_W} y1={ocy} x2={rightRailX} y2={ocy} />);
+          } else {
+            els.push(<line key={k()} className={wcls(rlo)} x1={branchX} y1={ocy} x2={xOut} y2={ocy} />);
+            drawCoil(o, xOut, ocy, rlo, outW);   // coils stretch to fill it, so the label has room
+          }
         });
       }
       y += h;
@@ -959,7 +1021,7 @@ function Ladder({ networks, themeKey, zoom = 1, xlate, sim }) {
 
 function disp(op) {
   if (op == null) return "";
-  return String(op).replace(/^"|"$/g, "");
+  return String(op).replace(/"/g, "");
 }
 function trunc(s, n) { s = String(s || ""); return s.length > n ? s.slice(0, n - 1) + "…" : s; }
 function isAddr(s) {
